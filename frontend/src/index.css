@@ -1,0 +1,42 @@
+:root {
+  font-family: "Segoe UI", system-ui, sans-serif;
+  line-height: 1.5;
+  color: #0f172a;
+  background: #f8fafc;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  min-height: 100vh;
+}
+
+.messageMarkdown p {
+  margin: 0 0 0.6rem 0;
+}
+
+.messageMarkdown ul,
+.messageMarkdown ol {
+  margin: 0.2rem 0 0.8rem 1.2rem;
+  padding: 0;
+}
+
+.messageMarkdown li {
+  margin: 0.2rem 0;
+}
+
+.messageMarkdown pre {
+  padding: 0.75rem;
+  overflow: auto;
+  border-radius: 10px;
+  background: #0b1020;
+  color: #e5e7eb;
+}
+
+.messageMarkdown code {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New",
+    monospace;
+}

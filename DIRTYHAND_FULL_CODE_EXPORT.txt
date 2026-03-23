@@ -1,0 +1,2915 @@
+================================================================================
+DIRTYHAND APP - FULL CODE EXPORT
+Copy each section into the corresponding file path. Do not alter the original app.
+================================================================================
+
+################################################################################
+# BACKEND: backend/requirements.txt
+# SAVE AS: backend/requirements.txt
+################################################################################
+
+# Web
+fastapi>=0.115.0
+uvicorn[standard]>=0.32.0
+python-multipart>=0.0.9
+slowapi>=0.1.9
+
+# Config & validation
+pydantic>=2.9.0
+pydantic-settings>=2.6.0
+python-dotenv>=1.0.0
+typing-extensions>=4.10.0
+
+# LangChain / LangGraph
+langchain>=0.3.0
+langchain-core>=0.3.0
+langchain-openai>=0.2.0
+langchain-community>=0.3.0
+langchain-text-splitters>=0.3.0
+langgraph>=0.2.0
+
+# RAG
+chromadb>=0.5.0
+pypdf>=5.0.0
+
+# Playwright
+playwright>=1.49.0
+
+# Async / HTTP
+nest-asyncio>=1.6.0
+httpx>=0.27.0
+
+# Observability
+langfuse>=2.0.0
+
+# Tests
+pytest>=8.3.0
+pytest-asyncio>=0.24.0
+
+################################################################################
+# BACKEND: backend/app/main.py
+# SAVE AS: backend/app/main.py
+################################################################################
+
+"""FastAPI application factory — production wiring."""
+
+import asyncio
+import sys
+from contextlib import asynccontextmanager
+from typing import Any
+
+from fastapi import Depends, FastAPI, HTTPException, Request
+from fastapi.exceptions import RequestValidationError
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
+from slowapi import Limiter, _rate_limit_exceeded_handler
+from slowapi.errors import RateLimitExceeded
+from slowapi.util import get_remote_address
+
+from app.api.deps import optional_service_auth
+from app.api.v1 import chat as chat_handlers
+from app.api.v1.ingest import ingest_text
+from app.api.v1.router import api_v1_router
+from app.api.v1.scrape_ingest import scrape_ingest as scrape_ingest_handler
+from app.api.v1.ingest_db import ingest_db as ingest_db_handler
+from app.exceptions import AppError, ConfigurationError
+from app.logging_config import get_logger, setup_logging
+from app.middleware.request_id import RequestIdMiddleware
+from app.middleware.request_size_limit import RequestSizeLimitMiddleware
+from app.services.agent_service import AgentService
+from app.services.browser_service import BrowserService
+from app.services.rag_service import RAGService
+from app.settings import Settings, get_settings
+
+logger = get_logger(__name__)
+
+# Playwright requires subprocess support on Windows.
+# Some environments can end up with an event loop that raises NotImplementedError
+# for asyncio subprocess_exec. Set the Windows Proactor policy early (module import time)
+# so it affects the event loop used by Uvicorn.
+if sys.platform.startswith("win"):
+    try:
+        if hasattr(asyncio, "WindowsProactorEventLoopPolicy"):
+            asyncio.set_event_loop_policy(asyncio.WindowsProactorEventLoopPolicy())
+    except Exception:
+        pass
+
+
+def _app_error_handler(request: Request, exc: AppError) -> JSONResponse:
+    settings = get_settings()
+    payload: dict[str, Any] = {"code": exc.code, "message": exc.message}
+    if settings.debug and exc.details:
+        payload["details"] = exc.details
+    return JSONResponse(status_code=400, content=payload)
+
+
+def _validation_error_handler(request: Request, exc: RequestValidationError) -> JSONResponse:
+    return JSONResponse(
+        status_code=422,
+        content={
+            "code": "validation_error",
+            "message": "Request validation failed",
+            "errors": exc.errors(),
+        },
+    )
+
+
+def _http_error_handler(request: Request, exc: HTTPException) -> JSONResponse:
+    """
+    Ensure HTTPException keeps its intended status code and detail payload.
+    A catch-all `Exception` handler can otherwise cause HTTPException to be
+    returned as a generic 500.
+    """
+    rid = getattr(request.state, "request_id", "-")
+    code = exc.detail.get("code") if isinstance(exc.detail, dict) else None
+    logger.info("HTTPException request_id=%s status=%s code=%s", rid, exc.status_code, code)
+    if isinstance(exc.detail, dict) and "code" in exc.detail and "message" in exc.detail:
+        return JSONResponse(status_code=exc.status_code, content=exc.detail)
+    return JSONResponse(status_code=exc.status_code, content={"detail": exc.detail})
+
+
+def _generic_error_handler(request: Request, exc: Exception) -> JSONResponse:
+    """Never expose stack traces; log internally, return clean API errors."""
+    settings = get_settings()
+    rid = getattr(request.state, "request_id", "-")
+    logger.exception("Unhandled error request_id=%s", rid)
+
+    exc_type = type(exc).__name__
+    if exc_type in {"PdfStreamError", "PdfReadError", "PdfError"}:
+        return JSONResponse(
+            status_code=400,
+            content={"code": "pdf_extract_error", "message": "Invalid or unreadable PDF."},
+        )
+
+    if settings.is_production or not settings.debug:
+        return JSONResponse(
+            status_code=500,
+            content={"code": "internal_error", "message": "An unexpected error occurred."},
+        )
+    return JSONResponse(
+        status_code=500,
+        content={"code": "internal_error", "message": str(exc), "type": type(exc).__name__},
+    )
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    settings = get_settings()
+    logger.info("Starting %s env=%s", settings.app_name, settings.environment)
+
+    if not settings.openai_api_key:
+        raise ConfigurationError(
+            "OPENAI_API_KEY is required. Set it in your .env file.",
+        )
+
+    browser = BrowserService(settings)
+    logger.info("Playwright startup deferred (lazy init)")
+    rag = RAGService(settings)
+    agent = AgentService(rag=rag, browser=browser, settings=settings)
+
+    app.state.browser = browser
+    app.state.rag = rag
+    app.state.agent = agent
+
+    yield
+
+    try:
+        await browser.stop()
+    except Exception:
+        pass
+    try:
+        from app.observability.langfuse_client import get_langfuse_client
+        client = get_langfuse_client()
+        if client:
+            client.flush()
+    except Exception:
+        pass
+    logger.info("Shutdown complete")
+
+
+def create_app() -> FastAPI:
+    settings = get_settings()
+    setup_logging()
+
+    limiter = Limiter(key_func=get_remote_address)
+    rate = f"{settings.rate_limit_per_minute}/minute"
+    chat_rate = f"{settings.rate_limit_chat_per_minute}/minute"
+
+    show_docs = (not settings.is_production) or settings.show_openapi
+
+    app = FastAPI(
+        title=settings.app_name,
+        version="1.0.0",
+        docs_url="/docs" if show_docs else None,
+        redoc_url="/redoc" if show_docs else None,
+        openapi_url="/openapi.json" if show_docs else None,
+        lifespan=lifespan,
+    )
+
+    app.state.limiter = limiter
+
+    app.add_middleware(RequestIdMiddleware)
+    app.add_middleware(RequestSizeLimitMiddleware)
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=settings.cors_origin_list,
+        allow_credentials=True,
+        allow_methods=["GET", "POST", "OPTIONS"],
+        allow_headers=["*"],
+    )
+
+    app.add_exception_handler(AppError, _app_error_handler)
+    app.add_exception_handler(HTTPException, _http_error_handler)
+    app.add_exception_handler(RequestValidationError, _validation_error_handler)
+    app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
+    app.add_exception_handler(Exception, _generic_error_handler)
+
+    app.include_router(api_v1_router, prefix="/api/v1")
+
+    app.add_api_route(
+        "/api/v1/chat",
+        limiter.limit(chat_rate)(chat_handlers.post_chat),
+        methods=["POST"],
+        tags=["chat"],
+        dependencies=[Depends(optional_service_auth)],
+        name="post_chat",
+    )
+    app.add_api_route(
+        "/api/v1/ingest",
+        limiter.limit(rate)(ingest_text),
+        methods=["POST"],
+        tags=["ingest"],
+        dependencies=[Depends(optional_service_auth)],
+        name="post_ingest",
+    )
+    app.add_api_route(
+        "/api/v1/scrape-ingest",
+        limiter.limit(rate)(scrape_ingest_handler),
+        methods=["POST"],
+        tags=["scrape"],
+        dependencies=[Depends(optional_service_auth)],
+        name="scrape_ingest",
+    )
+    app.add_api_route(
+        "/api/v1/ingest-db",
+        limiter.limit(rate)(ingest_db_handler),
+        methods=["POST"],
+        tags=["ingest"],
+        dependencies=[Depends(optional_service_auth)],
+        name="ingest_db",
+    )
+
+    @app.get("/")
+    async def root():
+        return {"service": settings.app_name, "version": "1.0.0", "docs": "/docs" if show_docs else None}
+
+    return app
+
+
+app = create_app()
+
+################################################################################
+# BACKEND: backend/app/settings.py
+# SAVE AS: backend/app/settings.py
+################################################################################
+
+"""Validated application settings (12-factor / production)."""
+
+from functools import lru_cache
+from pathlib import Path
+from typing import Literal
+
+from pydantic import Field, field_validator
+from pydantic_settings import BaseSettings, SettingsConfigDict
+from dotenv import dotenv_values
+
+_PROJECT_ROOT = Path(__file__).resolve().parents[2]
+
+
+class Settings(BaseSettings):
+    model_config = SettingsConfigDict(
+        env_file=_PROJECT_ROOT / ".env",
+        env_file_encoding="utf-8",
+        extra="ignore",
+    )
+
+    app_name: str = "Agentic RAG Chatbot API"
+    environment: Literal["development", "staging", "production"] = Field(
+        default="development",
+        alias="ENVIRONMENT",
+    )
+    debug: bool = False
+    log_level: str = "INFO"
+    show_openapi: bool = Field(default=False, alias="SHOW_OPENAPI")
+
+    openai_api_key: str = Field(default="", alias="OPENAI_API_KEY")
+
+    @field_validator("openai_api_key", mode="before")
+    @classmethod
+    def _fallback_if_placeholder(cls, v: str) -> str:
+        if isinstance(v, str) and v.strip() and v.strip().startswith("sk-test-"):
+            vals = dotenv_values(_PROJECT_ROOT / ".env")
+            real = (vals.get("OPENAI_API_KEY") or "").strip()
+            return real
+        return v or ""
+
+    llm_model: str = Field(default="gpt-5.4", alias="LLM_MODEL")
+    embedding_model: str = Field(default="text-embedding-3-large", alias="EMBEDDING_MODEL")
+
+    rag_collection_name: str = Field(default="rag_docs_gpt54_emb3l", alias="RAG_COLLECTION_NAME")
+    chroma_persist_dir: Path = Field(
+        default=_PROJECT_ROOT / "backend" / "data" / "chroma",
+        alias="CHROMA_PERSIST_DIR",
+    )
+
+    cors_origins: str = Field(
+        default="http://localhost:5173,http://127.0.0.1:5173",
+        alias="CORS_ORIGINS",
+    )
+
+    api_service_key: str = Field(default="", alias="API_SERVICE_KEY")
+
+    rate_limit_per_minute: int = Field(default=60, alias="RATE_LIMIT_PER_MINUTE")
+    rate_limit_chat_per_minute: int = Field(default=20, alias="RATE_LIMIT_CHAT_PER_MINUTE")
+
+    max_request_bytes_chat: int = Field(default=8_000_000, alias="MAX_REQUEST_BYTES_CHAT")
+    max_request_bytes_ingest: int = Field(default=8_000_000, alias="MAX_REQUEST_BYTES_INGEST")
+    max_request_bytes_scrape_ingest: int = Field(default=5_000_000, alias="MAX_REQUEST_BYTES_SCRAPE_INGEST")
+    max_request_bytes_ingest_db: int = Field(default=50_000_000, alias="MAX_REQUEST_BYTES_INGEST_DB")
+
+    playwright_headless: bool = Field(default=True, alias="PLAYWRIGHT_HEADLESS")
+    playwright_timeout_ms: int = Field(default=30_000, alias="PLAYWRIGHT_TIMEOUT_MS")
+    playwright_action_timeout_ms: int = Field(default=10_000, alias="PLAYWRIGHT_ACTION_TIMEOUT_MS")
+    playwright_allowed_domains: str = Field(default="", alias="PLAYWRIGHT_ALLOWED_DOMAINS")
+    playwright_enforce_domain_allowlist: bool = Field(default=False, alias="PLAYWRIGHT_ENFORCE_DOMAIN_ALLOWLIST")
+    playwright_block_private_ips: bool = Field(default=False, alias="PLAYWRIGHT_BLOCK_PRIVATE_IPS")
+
+    rag_retrieval_k: int = Field(default=4, alias="RAG_RETRIEVAL_K")
+    agent_recursion_limit: int = Field(default=25, alias="AGENT_RECURSION_LIMIT")
+
+    rag_min_relevance: float = Field(default=0.0, alias="RAG_MIN_RELEVANCE")
+    rag_max_docs_in_context: int = Field(default=8, alias="RAG_MAX_DOCS_IN_CONTEXT")
+
+    langfuse_public_key: str = Field(default="", alias="LANGFUSE_PUBLIC_KEY")
+    langfuse_secret_key: str = Field(default="", alias="LANGFUSE_SECRET_KEY")
+    langfuse_host: str = Field(default="https://cloud.langfuse.com", alias="LANGFUSE_HOST")
+
+    organization_url: str = Field(default="", alias="ORGANIZATION_URL")
+
+    @field_validator("chroma_persist_dir", mode="before")
+    @classmethod
+    def resolve_chroma_path(cls, v: str | Path) -> Path:
+        p = Path(v)
+        return p if p.is_absolute() else (_PROJECT_ROOT / p).resolve()
+
+    @property
+    def cors_origin_list(self) -> list[str]:
+        return [o.strip() for o in self.cors_origins.split(",") if o.strip()]
+
+    @property
+    def is_production(self) -> bool:
+        return self.environment == "production"
+
+    @property
+    def langfuse_enabled(self) -> bool:
+        return bool(self.langfuse_public_key and self.langfuse_secret_key)
+
+
+@lru_cache
+def get_settings() -> Settings:
+    return Settings()
+
+
+def clear_settings_cache() -> None:
+    get_settings.cache_clear()
+
+################################################################################
+# BACKEND: backend/app/logging_config.py
+# SAVE AS: backend/app/logging_config.py
+################################################################################
+
+"""Structured logging for production observability."""
+
+import logging
+import sys
+from typing import Any
+
+from app.context import request_id_var
+from app.settings import get_settings
+
+
+def setup_logging() -> None:
+    settings = get_settings()
+    level = getattr(logging, settings.log_level.upper(), logging.INFO)
+
+    root = logging.getLogger()
+    root.handlers.clear()
+    root.setLevel(level)
+
+    handler = logging.StreamHandler(sys.stdout)
+    handler.setLevel(level)
+    fmt = (
+        "%(asctime)s | %(levelname)s | %(name)s | "
+        "request_id=%(request_id)s | %(message)s"
+    )
+
+    class RequestIdFilter(logging.Filter):
+        def filter(self, record: logging.LogRecord) -> bool:
+            record.request_id = request_id_var.get()
+            return True
+
+    handler.setFormatter(logging.Formatter(fmt))
+    handler.addFilter(RequestIdFilter())
+    root.addHandler(handler)
+
+    if settings.is_production:
+        logging.getLogger("httpx").setLevel(logging.WARNING)
+        logging.getLogger("httpcore").setLevel(logging.WARNING)
+        logging.getLogger("chromadb").setLevel(logging.WARNING)
+
+
+def get_logger(name: str) -> logging.Logger:
+    return logging.getLogger(name)
+
+
+def log_extra(request_id: str | None = None) -> dict[str, Any]:
+    return {"request_id": request_id or "-"}
+
+################################################################################
+# BACKEND: backend/app/exceptions.py
+# SAVE AS: backend/app/exceptions.py
+################################################################################
+
+"""Application-specific errors."""
+
+from typing import Any
+
+
+class AppError(Exception):
+    """Base application error."""
+
+    def __init__(self, message: str, code: str = "app_error", details: dict[str, Any] | None = None):
+        super().__init__(message)
+        self.message = message
+        self.code = code
+        self.details = details or {}
+
+
+class ConfigurationError(AppError):
+    def __init__(self, message: str):
+        super().__init__(message, code="configuration_error")
+
+
+class AgentExecutionError(AppError):
+    def __init__(self, message: str, details: dict[str, Any] | None = None):
+        super().__init__(message, code="agent_execution_error", details=details)
+
+
+class RAGError(AppError):
+    def __init__(self, message: str):
+        super().__init__(message, code="rag_error")
+
+################################################################################
+# BACKEND: backend/app/context.py
+# SAVE AS: backend/app/context.py
+################################################################################
+
+"""Request-scoped context for logging (async-safe)."""
+
+import contextvars
+
+request_id_var: contextvars.ContextVar[str] = contextvars.ContextVar(
+    "request_id",
+    default="-",
+)
+
+
+def set_request_id(rid: str) -> contextvars.Token[str]:
+    return request_id_var.set(rid)
+
+
+def reset_request_id(token: contextvars.Token[str]) -> None:
+    request_id_var.reset(token)
+
+################################################################################
+# BACKEND: backend/app/services/agent_service.py
+# SAVE AS: backend/app/services/agent_service.py
+################################################################################
+
+"""LangGraph agent with Playwright tools and RAG context (no MemorySaver / checkpointer)."""
+
+from __future__ import annotations
+
+import logging
+from typing import Annotated, Any
+
+from langchain_core.messages import BaseMessage, HumanMessage, SystemMessage
+from langchain_openai import ChatOpenAI
+from langgraph.graph import START, StateGraph
+from langgraph.graph.message import add_messages
+from langgraph.prebuilt import ToolNode, tools_condition
+from typing_extensions import TypedDict
+
+from app.exceptions import AgentExecutionError, ConfigurationError
+from app.services.browser_service import BrowserService
+from app.services.rag_service import RAGService
+from app.settings import Settings, get_settings
+
+logger = logging.getLogger(__name__)
+
+
+class AgentState(TypedDict):
+    messages: Annotated[list[Any], add_messages]
+
+
+def _make_playwright_tools(browser: BrowserService, rag: RAGService, default_url: str) -> list:
+    from langchain_core.tools import tool
+
+    @tool
+    async def scrape_text(
+        url: str | None = None,
+        max_chars: int = 20000,
+    ) -> str:
+        """Scrape a URL with Playwright and return page text (truncated to max_chars).
+
+        This is a single-shot tool (no separate navigate/extract calls), which is safer under concurrency.
+        """
+        target_url = (url or default_url).strip()
+        if not target_url:
+            raise ConfigurationError(
+                "Missing URL for scrape_text: provide `url` or set ORGANIZATION_URL in .env"
+            )
+        if "://" not in target_url:
+            target_url = f"https://{target_url}"
+        text = await browser.navigate_and_extract_text(target_url)
+        truncated = len(text) > max_chars
+        return (
+            f"Scraped {len(text)} chars from {target_url}."
+            + (" TRUNCATED." if truncated else "")
+            + "\n\n"
+            + text[:max_chars]
+        )
+
+    @tool
+    async def scrape_and_ingest(
+        url: str | None = None,
+        max_chars: int = 20000,
+    ) -> str:
+        """Scrape a URL with Playwright and ingest the text into the RAG store.
+
+        Returns truncated scraped text so the LLM can answer in the same request.
+        """
+        target_url = (url or default_url).strip()
+        if not target_url:
+            raise ConfigurationError(
+                "Missing URL for scrape_and_ingest: provide `url` or set ORGANIZATION_URL in .env"
+            )
+        if "://" not in target_url:
+            target_url = f"https://{target_url}"
+        text = await browser.navigate_and_extract_text(target_url)
+        truncated = len(text) > max_chars
+        ingest_text = text[:max_chars]
+        chunks_added = rag.add_text(ingest_text, metadata={"source": target_url})
+        suffix = " (truncated)" if truncated else ""
+        sample = ingest_text[:2000]
+        return (
+            f"Scraped {len(text)} chars from {target_url}{suffix}. "
+            f"Ingested {chunks_added} chunks into RAG. "
+            f"Sample (first {len(sample)} chars):\n{sample}"
+        )
+
+    return [scrape_text, scrape_and_ingest]
+
+
+class AgentService:
+    """Compiles graph once; stateless between HTTP requests (client sends history)."""
+
+    def __init__(
+        self,
+        rag: RAGService,
+        browser: BrowserService,
+        settings: Settings | None = None,
+    ):
+        self._settings = settings or get_settings()
+        self._rag = rag
+        self._browser = browser
+        if not self._settings.openai_api_key:
+            raise ConfigurationError("OPENAI_API_KEY is not set")
+        self._tools = _make_playwright_tools(browser, rag, default_url=self._settings.organization_url)
+        self._llm = ChatOpenAI(
+            model=self._settings.llm_model,
+            api_key=self._settings.openai_api_key,
+            temperature=0.2,
+        )
+        self._llm_with_tools = self._llm.bind_tools(self._tools)
+        self._graph = self._build_graph()
+
+    def _build_graph(self):
+        def chatbot(state: AgentState) -> dict[str, list[BaseMessage]]:
+            messages = list(state["messages"])
+            response = self._llm_with_tools.invoke(messages)
+            return {"messages": [response]}
+
+        graph_builder = StateGraph(AgentState)
+        graph_builder.add_node("chatbot", chatbot)
+        graph_builder.add_node("tools", ToolNode(self._tools))
+        graph_builder.add_conditional_edges("chatbot", tools_condition)
+        graph_builder.add_edge("tools", "chatbot")
+        graph_builder.add_edge(START, "chatbot")
+        return graph_builder.compile()
+
+    def _with_rag_context(self, messages: list[BaseMessage]) -> list[BaseMessage]:
+        """Inject RAG once per request (not on every agent/tool loop)."""
+        last_human = _last_human_text(messages)
+
+        if not last_human:
+            return list(messages)
+
+        ctx = self._rag.format_context(last_human)
+        if not ctx:
+            return list(messages)
+
+        rag_msg = SystemMessage(content=f"Retrieved context:\n\n{ctx}")
+
+        insert_at = 0
+        for i, m in enumerate(messages):
+            if isinstance(m, SystemMessage):
+                insert_at = i + 1
+            else:
+                break
+        return list(messages)[:insert_at] + [rag_msg] + list(messages)[insert_at:]
+
+    async def ainvoke(self, messages: list[BaseMessage]) -> list[BaseMessage]:
+        config = {"recursion_limit": self._settings.agent_recursion_limit}
+        augmented = self._with_rag_context(list(messages))
+        try:
+            result = await self._graph.ainvoke({"messages": augmented}, config=config)
+            return list(result["messages"])
+        except Exception as e:
+            logger.exception("Agent invocation failed")
+            raise AgentExecutionError(str(e), details={"type": type(e).__name__}) from e
+
+
+def _last_human_text(messages: list[BaseMessage]) -> str:
+    for m in reversed(messages):
+        if isinstance(m, HumanMessage):
+            c = m.content
+            return c if isinstance(c, str) else str(c)
+    return ""
+
+################################################################################
+# BACKEND: backend/app/services/rag_service.py
+# SAVE AS: backend/app/services/rag_service.py
+################################################################################
+
+"""Persistent Chroma RAG — replaces conversational MemorySaver for document context."""
+
+from __future__ import annotations
+
+import logging
+from typing import TYPE_CHECKING
+
+from langchain_community.vectorstores import Chroma
+from langchain_core.documents import Document
+from langchain_openai import OpenAIEmbeddings
+from langchain_text_splitters import RecursiveCharacterTextSplitter
+
+from app.exceptions import ConfigurationError, RAGError
+from app.settings import Settings, get_settings
+
+if TYPE_CHECKING:
+    pass
+
+logger = logging.getLogger(__name__)
+
+
+class RAGService:
+    def __init__(self, settings: Settings | None = None):
+        self._settings = settings or get_settings()
+        if not self._settings.openai_api_key:
+            raise ConfigurationError("OPENAI_API_KEY is not set in environment")
+        self._embeddings = OpenAIEmbeddings(
+            api_key=self._settings.openai_api_key,
+            model=self._settings.embedding_model,
+        )
+        self._persist = self._settings.chroma_persist_dir
+        self._persist.mkdir(parents=True, exist_ok=True)
+        self._collection = self._settings.rag_collection_name
+        self._vectorstore: Chroma | None = None
+        self._splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=150)
+
+    @property
+    def vectorstore(self) -> Chroma:
+        if self._vectorstore is None:
+            self._vectorstore = Chroma(
+                collection_name=self._collection,
+                embedding_function=self._embeddings,
+                persist_directory=str(self._persist),
+            )
+        return self._vectorstore
+
+    def add_text(self, text: str, metadata: dict | None = None) -> int:
+        """Chunk and ingest plain text."""
+        if not text.strip():
+            raise RAGError("Empty text cannot be ingested")
+        docs = self._splitter.create_documents([text], metadatas=[metadata or {}])
+        return self.add_documents(docs)
+
+    def add_documents(self, documents: list[Document]) -> int:
+        try:
+            self.vectorstore.add_documents(documents)
+            if hasattr(self.vectorstore, "persist"):
+                self.vectorstore.persist()
+        except Exception as e:
+            logger.exception("RAG ingest failed")
+            raise RAGError(str(e)) from e
+        return len(documents)
+
+    def similarity_search(self, query: str, k: int | None = None) -> list[Document]:
+        k = k if k is not None else self._settings.rag_retrieval_k
+        try:
+            return self.vectorstore.similarity_search(query, k=k)
+        except Exception as e:
+            logger.exception("RAG search failed")
+            raise RAGError(str(e)) from e
+
+    def format_context(self, query: str, k: int | None = None) -> str:
+        k = k if k is not None else self._settings.rag_retrieval_k
+        max_docs = min(k, self._settings.rag_max_docs_in_context)
+        min_relevance = self._settings.rag_min_relevance
+
+        docs_with_scores: list[tuple[Document, float]]
+        try:
+            docs_with_scores = self.vectorstore.similarity_search_with_relevance_scores(query, k=k)
+        except Exception:
+            docs = self.similarity_search(query, k=k)
+            docs_with_scores = [(d, 1.0) for d in docs]
+
+        filtered = [(d, s) for (d, s) in docs_with_scores if s >= min_relevance]
+        if not filtered:
+            return ""
+
+        parts: list[str] = []
+        for i, (d, _) in enumerate(filtered[:max_docs], 1):
+            src = d.metadata.get("source", "document")
+            parts.append(f"[{i}] (source: {src})\n{d.page_content}")
+        return "\n\n---\n\n".join(parts)
+
+################################################################################
+# BACKEND: backend/app/services/browser_service.py
+# SAVE AS: backend/app/services/browser_service.py
+################################################################################
+
+"""Playwright browser lifecycle — session page for navigate → extract tool chains."""
+
+from __future__ import annotations
+
+import asyncio
+import ipaddress
+import logging
+from urllib.parse import urlparse
+from typing import Any
+
+from playwright.async_api import Browser, Page, async_playwright
+from playwright.sync_api import sync_playwright
+
+from app.exceptions import AppError
+from app.settings import Settings, get_settings
+
+logger = logging.getLogger(__name__)
+
+
+class BrowserService:
+    def __init__(self, settings: Settings | None = None):
+        self._settings = settings or get_settings()
+        self._playwright: Any = None
+        self._browser: Browser | None = None
+        self._context: Any = None
+        self._lock = asyncio.Lock()
+        self._started = False
+        self._sync_fallback = False
+        self._session_page: Page | None = None
+        self._sync_last_url: str | None = None
+        self._sync_last_text: str | None = None
+
+    async def start(self) -> None:
+        async with self._lock:
+            if self._started:
+                return
+            logger.info("Starting Playwright Chromium")
+            try:
+                self._playwright = await async_playwright().start()
+            except NotImplementedError as e:
+                logger.warning(
+                    "Async Playwright unavailable (%s). Enabling sync-thread fallback mode.",
+                    e,
+                )
+                self._sync_fallback = True
+                self._started = True
+                return
+            self._browser = await self._playwright.chromium.launch(
+                headless=self._settings.playwright_headless,
+            )
+            self._context = None
+            self._started = True
+
+    async def stop(self) -> None:
+        async with self._lock:
+            if self._session_page:
+                try:
+                    await self._session_page.close()
+                except Exception:
+                    pass
+                self._session_page = None
+            if self._context:
+                try:
+                    await self._context.close()
+                except Exception:
+                    pass
+                self._context = None
+            if self._browser:
+                await self._browser.close()
+                self._browser = None
+            if self._playwright:
+                await self._playwright.stop()
+                self._playwright = None
+            self._sync_fallback = False
+            self._sync_last_url = None
+            self._sync_last_text = None
+            self._started = False
+            logger.info("Playwright stopped")
+
+    async def _ensure_browser(self) -> Browser:
+        if not self._browser and not self._sync_fallback:
+            await self.start()
+        if self._sync_fallback:
+            return None  # type: ignore[return-value]
+        assert self._browser is not None
+        return self._browser
+
+    def _sync_scrape(self, url: str) -> tuple[str, str, str]:
+        with sync_playwright() as p:
+            browser = p.chromium.launch(headless=self._settings.playwright_headless)
+            page = browser.new_page()
+            page.set_default_timeout(self._settings.playwright_action_timeout_ms)
+            page.goto(
+                url,
+                wait_until="domcontentloaded",
+                timeout=self._settings.playwright_action_timeout_ms,
+            )
+            final_url = page.url
+            title = page.title()
+            text = page.evaluate(
+                """() => {
+                    const s = document.querySelector('main, article, [role="main"]')
+                      || document.body;
+                    return s ? s.innerText : '';
+                }"""
+            )
+            browser.close()
+        cleaned = (text or "").strip()
+        return final_url, title, cleaned
+
+    def _log_action(self, action: str, *, url: str | None = None, **fields: Any) -> None:
+        base = f"playwright_action={action}"
+        if url:
+            base += f" url={url}"
+        if fields:
+            base += " " + " ".join(f"{k}={v}" for k, v in fields.items())
+        logger.info(base)
+
+    def _allowed_domains(self) -> set[str]:
+        explicit = [d.strip().lower() for d in (self._settings.playwright_allowed_domains or "").split(",") if d.strip()]
+        if explicit:
+            return set(explicit)
+        if self._settings.playwright_enforce_domain_allowlist and self._settings.organization_url:
+            try:
+                parsed = urlparse(self._settings.organization_url)
+                if parsed.hostname:
+                    return {parsed.hostname.lower()}
+            except Exception:
+                return set()
+        return set()
+
+    def _host_is_private(self, hostname: str) -> bool:
+        h = hostname.lower().strip(".")
+        if h in ("localhost",):
+            return True
+        if h in ("127.0.0.1", "0.0.0.0", "::1"):
+            return True
+        try:
+            ip = ipaddress.ip_address(h)
+        except ValueError:
+            return False
+        return bool(ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_reserved or ip.is_multicast)
+
+    def _validate_navigation_target(self, url: str) -> str:
+        parsed = urlparse(url)
+        if parsed.scheme not in ("http", "https"):
+            raise AppError("URL scheme not allowed", code="url_blocked")
+        if not parsed.hostname:
+            raise AppError("URL hostname missing", code="url_blocked")
+
+        hostname = parsed.hostname.strip().lower()
+
+        if self._settings.playwright_block_private_ips and self._host_is_private(hostname):
+            raise AppError("URL host not allowed", code="url_blocked")
+
+        allowed = self._allowed_domains()
+        if self._settings.playwright_enforce_domain_allowlist:
+            if not allowed:
+                raise AppError("URL host not allowed", code="url_blocked")
+            if not any(hostname == d or hostname.endswith("." + d) for d in allowed):
+                raise AppError("URL host not allowed", code="url_blocked")
+
+        return url.strip()
+
+    async def navigate_browser(self, url: str) -> str:
+        url = url.strip()
+        if not url:
+            raise AppError("URL is required", code="invalid_url")
+        await self._ensure_browser()
+        async with self._lock:
+            self._log_action("navigate_start", url=url)
+
+            if self._session_page:
+                try:
+                    await self._session_page.close()
+                except Exception:
+                    pass
+                self._session_page = None
+            try:
+                validated = self._validate_navigation_target(url)
+                if self._sync_fallback:
+                    final_url, title, text = await asyncio.to_thread(self._sync_scrape, validated)
+                    _ = self._validate_navigation_target(final_url)
+                    self._sync_last_url = final_url
+                    self._sync_last_text = text
+                    self._log_action("navigate_end", url=final_url, title=(title or "").strip()[:120])
+                    return f"Navigated to {final_url}. Page title: {title}"
+                assert self._browser is not None
+                self._session_page = await self._browser.new_page()
+                self._session_page.set_default_timeout(self._settings.playwright_action_timeout_ms)
+
+                await self._session_page.add_init_script(
+                    """() => {
+                        document.addEventListener('submit', (e) => {
+                          try {
+                            if (e && e.isTrusted === false) { e.preventDefault(); }
+                          } catch (_) {}
+                        }, true);
+                      }"""
+                )
+
+                async def _on_download(download: Any) -> None:
+                    try:
+                        cancel = getattr(download, "cancel", None)
+                        if callable(cancel):
+                            maybe = cancel()
+                            if asyncio.iscoroutine(maybe):
+                                await maybe
+                    except Exception:
+                        pass
+
+                self._session_page.on("download", _on_download)
+
+                await self._session_page.goto(
+                    validated,
+                    wait_until="domcontentloaded",
+                    timeout=self._settings.playwright_action_timeout_ms,
+                )
+                final_url = self._session_page.url
+                _ = self._validate_navigation_target(final_url)
+                title = await self._session_page.title()
+                self._log_action("navigate_end", url=final_url, title=(title or "").strip()[:120])
+                return f"Navigated to {final_url}. Page title: {title}"
+            except Exception as e:
+                if isinstance(e, AppError):
+                    raise
+                logger.exception("navigate failed")
+                if self._session_page:
+                    try:
+                        await self._session_page.close()
+                    except Exception:
+                        pass
+                    self._session_page = None
+                raise AppError(f"Navigation failed: {e}", code="navigation_error") from e
+
+    async def extract_text(self) -> str:
+        async with self._lock:
+            if self._sync_fallback:
+                if not self._sync_last_url:
+                    raise AppError(
+                        "No active page. Call navigate_browser first.",
+                        code="no_active_page",
+                    )
+                cleaned = (self._sync_last_text or "").strip()
+                self._log_action("extract_text_end", url=self._sync_last_url, chars=len(cleaned))
+                return cleaned
+            if not self._session_page:
+                raise AppError(
+                    "No active page. Call navigate_browser first.",
+                    code="no_active_page",
+                )
+            try:
+                self._log_action("extract_text_start", url=getattr(self._session_page, "url", None))
+                text = await self._session_page.evaluate(
+                    """() => {
+                        const s = document.querySelector('main, article, [role="main"]')
+                          || document.body;
+                        return s ? s.innerText : '';
+                    }"""
+                )
+                cleaned = (text or "").strip()
+                self._log_action("extract_text_end", url=getattr(self._session_page, "url", None), chars=len(cleaned))
+                return cleaned
+            except Exception as e:
+                logger.exception("extract_text failed")
+                raise AppError(f"Extract failed: {e}", code="extract_error") from e
+
+    async def navigate_and_extract_text(self, url: str) -> str:
+        """Single-shot scrape without relying on session page."""
+        await self.navigate_browser(url)
+        return await self.extract_text()
+
+################################################################################
+# BACKEND: backend/app/api/v1/chat.py
+# SAVE AS: backend/app/api/v1/chat.py
+################################################################################
+
+import logging
+import time
+from typing import Annotated, Any
+
+from fastapi import Depends, HTTPException, Request, status
+from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, SystemMessage
+
+from app.api.deps import get_agent, get_app_settings, get_rag, optional_service_auth
+from app.evaluation import evaluate_answer
+from app.exceptions import AgentExecutionError
+from app.observability.langfuse_client import trace_chat_request
+from app.schemas.chat import ChatRequest, ChatResponse
+from app.services.agent_service import AgentService
+from app.services.rag_service import RAGService
+from app.settings import Settings
+
+logger = logging.getLogger(__name__)
+
+
+def _last_user_message_text(messages: list) -> str:
+    for m in reversed(messages):
+        if isinstance(m, HumanMessage):
+            c = m.content
+            return c if isinstance(c, str) else str(c)
+    return ""
+
+
+def _to_lc_messages(messages: list) -> list[BaseMessage]:
+    out: list[BaseMessage] = []
+    for m in messages:
+        role = m["role"] if isinstance(m, dict) else getattr(m, "role", None)
+        content = m["content"] if isinstance(m, dict) else getattr(m, "content", "")
+        if role in ("user", "system"):
+            out.append(HumanMessage(content=content))
+        else:
+            out.append(AIMessage(content=content))
+    return out
+
+
+def _last_assistant_text(messages: list[BaseMessage]) -> str:
+    for m in reversed(messages):
+        if isinstance(m, AIMessage):
+            c = m.content
+            if isinstance(c, str):
+                return c
+            if isinstance(c, list):
+                parts = []
+                for block in c:
+                    if isinstance(block, dict) and block.get("type") == "text":
+                        parts.append(block.get("text", ""))
+                return "".join(parts) or str(c)
+            return str(c)
+    return ""
+
+
+async def post_chat(
+    request: Request,
+    body: ChatRequest,
+    agent: Annotated[AgentService, Depends(get_agent)],
+    rag: Annotated[RAGService, Depends(get_rag)],
+    settings: Annotated[Settings, Depends(get_app_settings)],
+):
+    lc_messages = _to_lc_messages(body.messages)
+    last_user_text = _last_user_message_text(lc_messages)
+
+    rag_context = rag.format_context(last_user_text) if last_user_text else ""
+    empty_retrieval = not rag_context.strip()
+
+    rid = getattr(request.state, "request_id", "-")
+    metadata = {"request_id": rid, "empty_retrieval": empty_retrieval}
+
+    with trace_chat_request(input_query=last_user_text, metadata=metadata) as span:
+        start = time.perf_counter()
+        try:
+            result_messages = await agent.ainvoke(lc_messages)
+            latency_ms = (time.perf_counter() - start) * 1000
+            text = _last_assistant_text(result_messages)
+            if not text:
+                text = "I could not produce a response."
+
+            score = evaluate_answer(text, rag_context, settings)
+
+            _safe_span_update(
+                span,
+                {**metadata, "ungrounded": score == 0},
+                latency_ms,
+                "success",
+                output={"response": text[:2000]},
+            )
+            _safe_span_score(span, score, "1=pass, 0=fail")
+
+            return ChatResponse(message=text)
+        except AgentExecutionError as e:
+            latency_ms = (time.perf_counter() - start) * 1000
+            logger.exception("Agent execution failed: %s", e.message)
+            _safe_span_update(
+                span, metadata, latency_ms, "agent_error",
+                output={"error": e.message},
+            )
+            _safe_span_score(span, 0, "agent_execution_error")
+            client_message = (
+                "Agent failed to execute."
+                if settings.is_production and not settings.debug
+                else e.message
+            )
+            raise HTTPException(
+                status_code=status.HTTP_502_BAD_GATEWAY,
+                detail={"code": e.code, "message": client_message},
+            ) from e
+        except Exception as e:
+            latency_ms = (time.perf_counter() - start) * 1000
+            logger.exception("Unhandled chat error")
+            _safe_span_update(
+                span, metadata, latency_ms, "exception",
+                output={"error": str(e)[:500]},
+            )
+            _safe_span_score(span, 0, "exception")
+            raise
+
+
+def _safe_span_update(span: Any, metadata: dict, latency_ms: float, status: str, **kwargs: Any) -> None:
+    try:
+        span.update(
+            metadata={**metadata, "latency_ms": round(latency_ms, 2), "status": status},
+            **kwargs,
+        )
+    except Exception as ex:
+        logger.warning("Langfuse span update failed: %s", ex)
+
+
+def _safe_span_score(span: Any, value: int | float, comment: str = "") -> None:
+    try:
+        span.score(name="pass_rate", value=float(value), comment=comment)
+    except Exception as ex:
+        logger.warning("Langfuse span score failed: %s", ex)
+
+################################################################################
+# BACKEND: backend/app/api/v1/ingest.py
+# SAVE AS: backend/app/api/v1/ingest.py
+################################################################################
+
+import logging
+from typing import Annotated
+
+from fastapi import Depends, HTTPException, Request, status
+
+from app.api.deps import get_app_settings, get_rag, optional_service_auth
+from app.exceptions import RAGError
+from app.schemas.chat import IngestRequest, IngestResponse
+from app.services.rag_service import RAGService
+from app.settings import Settings
+
+logger = logging.getLogger(__name__)
+
+
+async def ingest_text(
+    request: Request,
+    body: IngestRequest,
+    rag: Annotated[RAGService, Depends(get_rag)],
+    settings: Annotated[Settings, Depends(get_app_settings)],
+):
+    _ = request
+    _ = settings
+    meta = {}
+    if body.source:
+        meta["source"] = body.source
+    try:
+        n = rag.add_text(body.text, metadata=meta)
+    except RAGError as e:
+        logger.exception("Ingest failed")
+        client_message = (
+            "Ingest failed."
+            if settings.is_production and not settings.debug
+            else str(e)
+        )
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail={"code": "rag_error", "message": client_message},
+        ) from e
+    logger.info("Ingested %s chunks", n)
+    return IngestResponse(chunks_added=n)
+
+################################################################################
+# BACKEND: backend/app/api/v1/ingest_db.py
+# SAVE AS: backend/app/api/v1/ingest_db.py
+################################################################################
+
+import asyncio
+import logging
+
+from fastapi import APIRouter, Depends, File, Form, Request, UploadFile
+from pydantic import Field
+
+from app.api.deps import get_app_settings, get_rag, optional_service_auth
+from app.exceptions import RAGError
+from app.schemas.chat import IngestDbResponse
+from app.services.pdf_service import PDFService
+from app.settings import Settings
+
+logger = logging.getLogger(__name__)
+
+router = APIRouter(prefix="/ingest-db", tags=["ingest"])
+
+
+@router.post("", dependencies=[Depends(optional_service_auth)], response_model=IngestDbResponse)
+async def ingest_db(
+    request: Request,
+    file: UploadFile = File(...),
+    source: str | None = Form(default=None, max_length=512),
+    max_pages: int = Form(default=0, ge=0, le=2000),
+    settings: Settings = Depends(get_app_settings),
+    rag=Depends(get_rag),
+):
+    _ = request
+    _ = settings
+
+    filename = file.filename or "uploaded.pdf"
+    src_label = source or filename
+
+    if not (filename.lower().endswith(".pdf")):
+        from fastapi import HTTPException, status
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Only .pdf files are supported")
+
+    data = await file.read()
+    if not data:
+        from fastapi import HTTPException, status
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Empty PDF upload")
+
+    pdf_service = PDFService()
+
+    try:
+        try:
+            pages_text = await asyncio.to_thread(
+                pdf_service.extract_text_pages, data, max_pages=max_pages
+            )
+        except Exception as e:
+            logger.exception("PDF extraction failed")
+            from fastapi import HTTPException, status
+            client_message = (
+                "Invalid or unreadable PDF."
+                if settings.is_production and not settings.debug
+                else str(e)[:300]
+            )
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail={"code": "pdf_extract_error", "message": client_message},
+            ) from e
+
+        chars_extracted = sum(len(t or "") for t in pages_text)
+
+        try:
+            docs = pdf_service.chunk_pages(pages_text, source=src_label)
+        except Exception as e:
+            logger.exception("PDF chunking failed")
+            from fastapi import HTTPException, status
+            client_message = (
+                "Failed to process PDF content."
+                if settings.is_production and not settings.debug
+                else str(e)[:300]
+            )
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail={"code": "pdf_chunk_error", "message": client_message},
+            ) from e
+    except Exception:
+        raise
+
+    try:
+        chunks_added = rag.add_documents(docs)
+    except RAGError as e:
+        logger.exception("PDF ingest failed")
+        client_message = (
+            "PDF ingest failed."
+            if settings.is_production and not settings.debug
+            else str(e)
+        )
+        from fastapi import HTTPException, status
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail={"code": "rag_error", "message": client_message},
+        ) from e
+
+    return IngestDbResponse(
+        filename=filename,
+        pages_extracted=len(pages_text),
+        chars_extracted=chars_extracted,
+        chunks_added=chunks_added,
+    )
+
+################################################################################
+# BACKEND: backend/app/api/v1/scrape_ingest.py
+# SAVE AS: backend/app/api/v1/scrape_ingest.py
+################################################################################
+
+import logging
+
+from fastapi import APIRouter, Depends, HTTPException, Request
+from pydantic import HttpUrl, TypeAdapter, ValidationError
+
+from app.api.deps import get_app_settings, get_browser, get_rag, optional_service_auth
+from app.schemas.chat import ScrapeIngestRequest, ScrapeIngestResponse
+from app.services.browser_service import BrowserService
+from app.services.rag_service import RAGService
+from app.exceptions import ConfigurationError
+from app.settings import Settings
+
+logger = logging.getLogger(__name__)
+
+router = APIRouter(prefix="/scrape-ingest", tags=["scrape"])
+
+
+@router.post("", dependencies=[Depends(optional_service_auth)])
+async def scrape_ingest(
+    request: Request,
+    body: ScrapeIngestRequest,
+    rag: RAGService = Depends(get_rag),
+    browser: BrowserService = Depends(get_browser),
+    settings: Settings = Depends(get_app_settings),
+):
+    _ = request
+    url = (body.url or settings.organization_url).strip()
+    if not url:
+        raise ConfigurationError(
+            "Missing URL: provide `url` in the request or set ORGANIZATION_URL in .env"
+        )
+    if "://" not in url:
+        url = f"https://{url}"
+
+    try:
+        TypeAdapter(HttpUrl).validate_python(url)
+    except ValidationError as e:
+        raise HTTPException(status_code=422, detail=e.errors()) from e
+
+    scraped_text = await browser.navigate_and_extract_text(url)
+    chars_scraped = len(scraped_text)
+    ingest_text = scraped_text[: body.max_chars]
+
+    meta = {"source": body.source or url}
+    try:
+        chunks_added = rag.add_text(ingest_text, metadata=meta)
+    except Exception as e:
+        logger.exception("Scrape-ingest failed")
+        client_message = (
+            "Scrape-ingest failed."
+            if settings.is_production and not settings.debug
+            else str(e)
+        )
+        raise HTTPException(
+            status_code=502,
+            detail={"code": "scrape_ingest_error", "message": client_message},
+        ) from e
+
+    sample = ingest_text[:2000]
+    return ScrapeIngestResponse(
+        url=url,
+        chars_scraped=chars_scraped,
+        chunks_added=chunks_added,
+        sample=sample,
+    )
+
+################################################################################
+# BACKEND: backend/app/api/deps.py
+# SAVE AS: backend/app/api/deps.py
+################################################################################
+
+from typing import Annotated
+
+from fastapi import Depends, Header, HTTPException, Request, status
+
+from app.services.agent_service import AgentService
+from app.services.browser_service import BrowserService
+from app.services.rag_service import RAGService
+from app.settings import Settings, get_settings
+
+
+def get_app_settings() -> Settings:
+    return get_settings()
+
+
+def get_rag(request: Request) -> RAGService:
+    return request.app.state.rag
+
+
+def get_browser(request: Request) -> BrowserService:
+    return request.app.state.browser
+
+
+def get_agent(request: Request) -> AgentService:
+    return request.app.state.agent
+
+
+async def optional_service_auth(
+    settings: Annotated[Settings, Depends(get_app_settings)],
+    authorization: str | None = Header(default=None, alias="Authorization"),
+) -> None:
+    if not settings.api_service_key:
+        return
+    expected = f"Bearer {settings.api_service_key}"
+    if not authorization or authorization != expected:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid or missing Authorization bearer token",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+
+################################################################################
+# BACKEND: backend/app/api/v1/router.py
+# SAVE AS: backend/app/api/v1/router.py
+################################################################################
+
+from fastapi import APIRouter
+
+from app.api.v1 import health
+
+api_v1_router = APIRouter()
+api_v1_router.include_router(health.router)
+
+################################################################################
+# BACKEND: backend/app/api/v1/health.py
+# SAVE AS: backend/app/api/v1/health.py
+################################################################################
+
+from typing import Annotated
+
+from fastapi import APIRouter, Depends, Request
+
+from app.api.deps import get_app_settings
+from app.settings import Settings
+
+router = APIRouter(tags=["health"])
+
+
+@router.get("/health")
+async def health():
+    return {"status": "ok"}
+
+
+@router.get("/ready")
+async def ready(
+    request: Request,
+    settings: Annotated[Settings, Depends(get_app_settings)],
+):
+    checks: dict[str, str] = {}
+    ok = True
+
+    if not settings.openai_api_key:
+        checks["openai"] = "missing OPENAI_API_KEY"
+        ok = False
+    else:
+        checks["openai"] = "ok"
+
+    browser = getattr(request.app.state, "browser", None)
+    if browser and getattr(browser, "_started", False):
+        checks["playwright"] = "ok"
+    else:
+        checks["playwright"] = "not_started"
+        ok = False
+
+    rag = getattr(request.app.state, "rag", None)
+    if rag:
+        checks["rag"] = "ok"
+    else:
+        checks["rag"] = "missing"
+        ok = False
+
+    status_code = 200 if ok else 503
+    from fastapi.responses import JSONResponse
+
+    return JSONResponse(
+        status_code=status_code,
+        content={"ready": ok, "checks": checks},
+    )
+
+################################################################################
+# BACKEND: backend/app/schemas/chat.py
+# SAVE AS: backend/app/schemas/chat.py
+################################################################################
+
+import re
+from typing import Literal
+
+from pydantic import BaseModel, Field, field_validator, model_validator
+
+MAX_QUERY_LENGTH = 8_000
+MAX_MESSAGE_LENGTH = 50_000
+
+
+def _sanitize_string(value: str) -> str:
+    if not isinstance(value, str):
+        return str(value)
+    s = value.replace("\x00", "").strip()
+    return re.sub(r"\s+", " ", s) if s else ""
+
+
+class ChatMessage(BaseModel):
+    role: Literal["user", "assistant", "system"]
+    content: str = Field(..., min_length=1, max_length=MAX_MESSAGE_LENGTH)
+
+    @field_validator("content", mode="before")
+    @classmethod
+    def sanitize_content(cls, v: str) -> str:
+        s = _sanitize_string(v)
+        if not s:
+            raise ValueError("Message content cannot be empty")
+        return s
+
+class ChatRequest(BaseModel):
+    messages: list[ChatMessage] = Field(..., min_length=1, max_length=50)
+
+    @model_validator(mode="after")
+    def validate_last_user_message_length(self) -> "ChatRequest":
+        for m in reversed(self.messages):
+            if m.role == "user" and len(m.content) > MAX_QUERY_LENGTH:
+                raise ValueError(
+                    f"User message exceeds max length of {MAX_QUERY_LENGTH} characters"
+                )
+        return self
+
+
+class ChatResponse(BaseModel):
+    message: str
+    role: Literal["assistant"] = "assistant"
+
+
+class IngestRequest(BaseModel):
+    text: str = Field(..., min_length=1, max_length=2_000_000)
+    source: str | None = Field(default=None, max_length=512)
+
+
+class IngestResponse(BaseModel):
+    chunks_added: int
+
+
+class ScrapeIngestRequest(BaseModel):
+    url: str | None = Field(default=None)
+    max_chars: int = Field(default=20000, ge=1000, le=100000)
+    source: str | None = Field(default=None, max_length=512)
+
+
+class ScrapeIngestResponse(BaseModel):
+    url: str
+    chars_scraped: int
+    chunks_added: int
+    sample: str
+
+
+class IngestDbResponse(BaseModel):
+    filename: str
+    pages_extracted: int
+    chars_extracted: int
+    chunks_added: int
+
+################################################################################
+# BACKEND: backend/app/evaluation.py
+# SAVE AS: backend/app/evaluation.py
+################################################################################
+
+"""Pass-rate evaluation — simple heuristic or LLM judge for answer quality."""
+
+from __future__ import annotations
+
+import logging
+import re
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from app.settings import Settings
+
+logger = logging.getLogger(__name__)
+
+FAILURE_PHRASES = [
+    r"i\s+could\s+not\s+(produce|find)",
+    r"i\s+couldn't\s+find",
+    r"i\s+don't\s+have\s+(enough\s+)?information",
+    r"i\s+do\s+not\s+have",
+    r"no\s+(relevant\s+)?(results?|information|context|documents?)",
+    r"i\s+was\s+unable",
+    r"cannot\s+answer",
+    r"unable\s+to\s+answer",
+    r"i\s+don't\s+know",
+    r"i\s+am\s+not\s+sure",
+    r"insufficient\s+information",
+    r"no\s+context",
+]
+
+_FAILURE_RE = re.compile("|".join(f"({p})" for p in FAILURE_PHRASES), re.IGNORECASE)
+
+
+def evaluate_answer(
+    answer: str,
+    context: str,
+    settings: "Settings | None" = None,
+) -> int:
+    if not answer or not answer.strip():
+        return 0
+    answer_lower = answer.strip().lower()
+    context_lower = (context or "").strip().lower()
+
+    if not context_lower:
+        return 0
+
+    if _FAILURE_RE.search(answer_lower):
+        return 0
+
+    if context_lower and len(answer.strip()) < 20:
+        return 0
+
+    if context_lower:
+        context_words = set(w for w in re.split(r"\W+", context_lower) if len(w) > 4)
+        answer_words = set(w for w in re.split(r"\W+", answer_lower) if len(w) > 4)
+        overlap = len(context_words & answer_words) / max(len(context_words), 1)
+        if overlap < 0.02 and len(answer_words) > 5:
+            return 0
+
+    return 1
+
+################################################################################
+# BACKEND: backend/app/observability/langfuse_client.py
+# SAVE AS: backend/app/observability/langfuse_client.py
+################################################################################
+
+"""Langfuse client — optional tracing; no-op when credentials not configured."""
+
+from __future__ import annotations
+
+import logging
+from contextlib import contextmanager
+from typing import Any, Generator
+
+from app.settings import Settings, get_settings
+
+logger = logging.getLogger(__name__)
+
+_LANGFUSE_CLIENT: Any = None
+
+
+def get_langfuse_client(settings: Settings | None = None) -> Any | None:
+    global _LANGFUSE_CLIENT
+    s = settings or get_settings()
+    if not s.langfuse_enabled:
+        return None
+    if _LANGFUSE_CLIENT is None:
+        try:
+            from langfuse import Langfuse
+            _LANGFUSE_CLIENT = Langfuse(
+                public_key=s.langfuse_public_key,
+                secret_key=s.langfuse_secret_key,
+                host=s.langfuse_host,
+            )
+            logger.info("Langfuse client initialized")
+        except Exception as e:
+            logger.warning("Langfuse init failed: %s — tracing disabled", e)
+            return None
+    return _LANGFUSE_CLIENT
+
+
+@contextmanager
+def trace_chat_request(
+    input_query: str,
+    metadata: dict[str, Any] | None = None,
+) -> Generator[Any, None, None]:
+    client = get_langfuse_client()
+    if client is None:
+        yield _NoOpSpan()
+        return
+    meta = metadata or {}
+    try:
+        with client.start_as_current_observation(
+            as_type="span",
+            name="chat_request",
+            input={"query": input_query[:2000]},
+            metadata=meta,
+        ) as span:
+            yield span
+    except Exception as e:
+        logger.warning("Langfuse trace error: %s", e)
+        yield _NoOpSpan()
+
+
+class _NoOpSpan:
+    def score(self, *args: Any, **kwargs: Any) -> None:
+        pass
+
+    def update(self, *args: Any, **kwargs: Any) -> None:
+        pass
+
+################################################################################
+# BACKEND: backend/app/security/prompt_injection.py
+# SAVE AS: backend/app/security/prompt_injection.py
+################################################################################
+
+"""Prompt injection detection — blocks or logs malicious user input before LLM."""
+
+import logging
+import re
+from typing import Tuple
+
+logger = logging.getLogger(__name__)
+
+INJECTION_PATTERNS = [
+    r"ignore\s+(all\s+)?(previous|prior|above|all)\s+instructions",
+    r"disregard\s+(all\s+)?(previous|prior|above)",
+    r"forget\s+(everything|all)\s+(you|above)",
+    r"system\s+prompt",
+    r"reveal\s+(your|the)\s+(system\s+)?prompt",
+    r"show\s+(me\s+)?(your|the)\s+(system\s+)?(prompt|instructions)",
+    r"what\s+are\s+your\s+(system\s+)?instructions",
+    r"print\s+(your|the)\s+prompt",
+    r"output\s+your\s+system\s+message",
+    r"developer\s+mode",
+    r"jailbreak",
+    r"dane\s+mode",
+    r"you\s+are\s+now\s+in\s+.*\s+mode",
+    r"\[INST\]|\[/INST\]",
+    r"<\|im_start\|>|<\|im_end\|>",
+]
+
+_COMPILED = [re.compile(p, re.IGNORECASE) for p in INJECTION_PATTERNS]
+
+
+def check_prompt_injection(text: str) -> Tuple[bool, str | None]:
+    if not text or not text.strip():
+        return True, None
+    normalized = " ".join(text.split())
+    for pat in _COMPILED:
+        if pat.search(normalized):
+            return False, pat.pattern
+    return True, None
+
+
+def block_if_injection(text: str, log_event: bool = True) -> None:
+    is_safe, matched = check_prompt_injection(text)
+    if not is_safe and matched:
+        if log_event:
+            logger.warning(
+                "Prompt injection blocked: pattern=%s snippet=%s",
+                matched,
+                (text[:200] + "…") if len(text) > 200 else text,
+            )
+        from app.exceptions import AppError
+        raise AppError(
+            "Input contains disallowed content.",
+            code="prompt_injection_blocked",
+            details={"blocked_pattern": matched[:50]},
+        )
+
+
+def _is_high_risk_pattern(pattern_regex: str) -> bool:
+    high_risk_markers = [
+        "ignore\\s+", "disregard", "reveal\\s+", "print\\s+", "output\\s+your",
+        "jailbreak", "dane\\s+mode", "<\\\\|im_start\\\\|>", "<\\\\|im_end\\\\|>",
+        "you\\\\s+are\\\\s+now", "forget\\\\s+",
+    ]
+    return any(marker in pattern_regex for marker in high_risk_markers)
+
+
+def sanitize_or_block_prompt_injection(text: str, log_event: bool = True) -> str:
+    is_safe, matched = check_prompt_injection(text)
+    if is_safe:
+        return text
+    if not matched:
+        return text
+    if _is_high_risk_pattern(matched):
+        block_if_injection(text, log_event=log_event)
+    redacted = text
+    redacted = re.sub(r"system\\s+prompt", "[REDACTED SYSTEM PROMPT]", redacted, flags=re.IGNORECASE)
+    redacted = re.sub(
+        r"system\\s+instructions", "[REDACTED SYSTEM INSTRUCTIONS]", redacted, flags=re.IGNORECASE
+    )
+    redacted = re.sub(r"developer\\s+mode", "[REDACTED DEVELOPER MODE]", redacted, flags=re.IGNORECASE)
+    if log_event:
+        logger.warning("Prompt injection sanitized: pattern=%s snippet=%s", matched, (text[:200] + "…") if len(text) > 200 else text)
+    return redacted
+
+################################################################################
+# BACKEND: backend/app/security/output_safety.py
+# SAVE AS: backend/app/security/output_safety.py
+################################################################################
+
+"""Output safety — filter system prompts, API keys, and other sensitive data."""
+
+import re
+
+API_KEY_PATTERN = re.compile(
+    r"(sk-[a-zA-Z0-9]{20,})|"
+    r"(sk-proj-[a-zA-Z0-9_-]{20,})|"
+    r"(api[_-]?key['\"]?\s*[:=]\s*['\"]?[a-zA-Z0-9_-]{20,})",
+    re.IGNORECASE,
+)
+
+SYSTEM_LEAK_PATTERNS = [
+    (re.compile(r"As an AI (?:assistant|model)[^.]*\.", re.IGNORECASE), "[Response filtered]"),
+    (re.compile(r"You are (?:a helpful|an AI) (?:assistant|model)[^.]*\.", re.IGNORECASE), "[Response filtered]"),
+    (re.compile(r"\[System\s*:\s*[^\]]{50,}\]", re.IGNORECASE), "[Internal content redacted]"),
+    (re.compile(r"<\|(?:system|im_start)\|>[^<]{100,}"), "[Internal content redacted]"),
+]
+
+REDACTION_PLACEHOLDER = "[REDACTED]"
+
+
+def filter_sensitive_output(text: str) -> str:
+    if not text:
+        return text
+    out = text
+    out = API_KEY_PATTERN.sub(REDACTION_PLACEHOLDER, out)
+    for pat, replacement in SYSTEM_LEAK_PATTERNS:
+        out = pat.sub(replacement, out)
+    return out
+
+
+def contains_sensitive_output(text: str) -> bool:
+    if not text:
+        return False
+    if API_KEY_PATTERN.search(text):
+        return True
+    for pat, _replacement in SYSTEM_LEAK_PATTERNS:
+        if pat.search(text):
+            return True
+    return False
+
+################################################################################
+# BACKEND: backend/app/middleware/request_id.py
+# SAVE AS: backend/app/middleware/request_id.py
+################################################################################
+
+import uuid
+
+from starlette.middleware.base import BaseHTTPMiddleware
+from starlette.requests import Request
+from starlette.responses import Response
+
+from app.context import reset_request_id, set_request_id
+
+REQUEST_ID_HEADER = "X-Request-ID"
+
+
+class RequestIdMiddleware(BaseHTTPMiddleware):
+    async def dispatch(self, request: Request, call_next) -> Response:
+        rid = request.headers.get(REQUEST_ID_HEADER) or str(uuid.uuid4())
+        request.state.request_id = rid
+        token = set_request_id(rid)
+        try:
+            response = await call_next(request)
+            response.headers[REQUEST_ID_HEADER] = rid
+            return response
+        finally:
+            reset_request_id(token)
+
+################################################################################
+# BACKEND: backend/app/middleware/request_size_limit.py
+# SAVE AS: backend/app/middleware/request_size_limit.py
+################################################################################
+
+import logging
+
+from fastapi import HTTPException, status
+from starlette.middleware.base import BaseHTTPMiddleware
+from starlette.requests import Request
+from starlette.responses import Response
+
+from app.settings import Settings, get_settings
+
+logger = logging.getLogger(__name__)
+
+
+class RequestSizeLimitMiddleware(BaseHTTPMiddleware):
+    def __init__(self, app, settings: Settings | None = None):
+        super().__init__(app)
+        self._settings = settings or get_settings()
+
+    def _limit_for_path(self, path: str) -> int | None:
+        if path == "/api/v1/chat":
+            return self._settings.max_request_bytes_chat
+        if path == "/api/v1/ingest":
+            return self._settings.max_request_bytes_ingest
+        if path == "/api/v1/scrape-ingest":
+            return self._settings.max_request_bytes_scrape_ingest
+        if path == "/api/v1/ingest-db":
+            return self._settings.max_request_bytes_ingest_db
+        return None
+
+    async def dispatch(self, request: Request, call_next) -> Response:
+        limit = self._limit_for_path(request.url.path)
+        if limit is None:
+            return await call_next(request)
+
+        content_length = request.headers.get("content-length")
+        if content_length:
+            try:
+                size = int(content_length)
+            except ValueError:
+                size = 0
+            if size and size > limit:
+                raise HTTPException(
+                    status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+                    detail={"code": "request_too_large", "message": "Request payload too large"},
+                )
+        else:
+            if request.url.path != "/api/v1/ingest-db":
+                body = await request.body()
+                if body is not None and len(body) > limit:
+                    raise HTTPException(
+                        status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+                        detail={"code": "request_too_large", "message": "Request payload too large"},
+                    )
+
+        return await call_next(request)
+
+################################################################################
+# BACKEND: backend/app/services/pdf_service.py
+# SAVE AS: backend/app/services/pdf_service.py
+################################################################################
+
+from __future__ import annotations
+
+import io
+import logging
+from typing import Optional
+
+from langchain_core.documents import Document
+from langchain_text_splitters import RecursiveCharacterTextSplitter
+from pypdf import PdfReader
+
+logger = logging.getLogger(__name__)
+
+
+class PDFService:
+    def __init__(self, chunk_size: int = 1000, chunk_overlap: int = 150):
+        self._splitter = RecursiveCharacterTextSplitter(chunk_size=chunk_size, chunk_overlap=chunk_overlap)
+
+    def extract_text_pages(
+        self,
+        pdf_bytes: bytes,
+        *,
+        max_pages: int = 0,
+    ) -> list[str]:
+        reader = PdfReader(io.BytesIO(pdf_bytes))
+        total_pages = len(reader.pages)
+        use_pages = total_pages if max_pages <= 0 else min(total_pages, max_pages)
+        pages: list[str] = []
+        for i in range(use_pages):
+            page = reader.pages[i]
+            text = page.extract_text() or ""
+            pages.append(text)
+        return pages
+
+    def chunk_pages(
+        self,
+        pages_text: list[str],
+        *,
+        source: str,
+    ) -> list[Document]:
+        documents: list[Document] = []
+        for idx, text in enumerate(pages_text, start=1):
+            t = (text or "").strip()
+            if not t:
+                continue
+            docs = self._splitter.create_documents(
+                [t],
+                metadatas=[{"source": source, "page": idx}],
+            )
+            documents.extend(docs)
+        return documents
+
+################################################################################
+# BACKEND: backend/app/__init__.py
+# SAVE AS: backend/app/__init__.py
+################################################################################
+
+"""Agentic RAG chatbot backend."""
+
+__version__ = "1.0.0"
+
+################################################################################
+# BACKEND: backend/app/api/__init__.py
+# SAVE AS: backend/app/api/__init__.py
+################################################################################
+
+# API package
+
+################################################################################
+# BACKEND: backend/app/api/v1/__init__.py
+# SAVE AS: backend/app/api/v1/__init__.py
+################################################################################
+
+# API v1
+
+################################################################################
+# BACKEND: backend/app/services/__init__.py
+# SAVE AS: backend/app/services/__init__.py
+################################################################################
+
+# Services package
+
+################################################################################
+# BACKEND: backend/app/schemas/__init__.py
+# SAVE AS: backend/app/schemas/__init__.py
+################################################################################
+
+from app.schemas.chat import ChatMessage, ChatRequest, ChatResponse, IngestRequest, IngestResponse
+
+__all__ = [
+    "ChatMessage",
+    "ChatRequest",
+    "ChatResponse",
+    "IngestRequest",
+    "IngestResponse",
+]
+
+################################################################################
+# BACKEND: backend/app/observability/__init__.py
+# SAVE AS: backend/app/observability/__init__.py
+################################################################################
+
+"""Observability — Langfuse tracing and pass-rate scoring."""
+
+from app.observability.langfuse_client import get_langfuse_client
+
+__all__ = ["get_langfuse_client"]
+
+################################################################################
+# BACKEND: backend/app/security/__init__.py
+# SAVE AS: backend/app/security/__init__.py
+################################################################################
+
+"""Security hardening: input validation, prompt-injection, output filtering."""
+
+from app.security.output_safety import filter_sensitive_output
+from app.security.prompt_injection import check_prompt_injection
+
+__all__ = ["check_prompt_injection", "filter_sensitive_output"]
+
+################################################################################
+# BACKEND: backend/app/middleware/__init__.py
+# SAVE AS: backend/app/middleware/__init__.py
+################################################################################
+
+from app.middleware.request_id import RequestIdMiddleware
+
+__all__ = ["RequestIdMiddleware"]
+
+================================================================================
+FRONTEND - START
+================================================================================
+
+################################################################################
+# FRONTEND: frontend/index.html
+# SAVE AS: frontend/index.html
+################################################################################
+
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>RAG Agent Chat</title>
+  </head>
+  <body>
+    <div id="root"></div>
+    <script type="module" src="/src/main.tsx"></script>
+  </body>
+</html>
+
+################################################################################
+# FRONTEND: frontend/package.json
+# SAVE AS: frontend/package.json
+################################################################################
+
+{
+  "name": "rag-chatbot-ui",
+  "private": true,
+  "version": "1.0.0",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "tsc --noEmit && vite build",
+    "preview": "vite preview",
+    "lint": "eslint ."
+  },
+  "dependencies": {
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1",
+    "react-markdown": "^10.1.0",
+    "remark-gfm": "^4.0.1"
+  },
+  "devDependencies": {
+    "@types/node": "^22.9.0",
+    "@types/react": "^18.3.12",
+    "@types/react-dom": "^18.3.1",
+    "@vitejs/plugin-react": "^4.3.3",
+    "typescript": "~5.6.2",
+    "vite": "^5.4.10"
+  }
+}
+
+################################################################################
+# FRONTEND: frontend/vite.config.ts
+# SAVE AS: frontend/vite.config.ts
+################################################################################
+
+import { defineConfig, loadEnv } from "vite";
+import react from "@vitejs/plugin-react";
+import path from "node:path";
+
+export default defineConfig(({ mode }) => {
+  const env = loadEnv(mode, process.cwd(), "");
+  const target = env.VITE_API_PROXY_TARGET || "http://127.0.0.1:8000";
+  return {
+    plugins: [react()],
+    resolve: {
+      alias: { "@": path.resolve(__dirname, "src") },
+    },
+    server: {
+      port: 5173,
+      proxy: {
+        "/api": { target, changeOrigin: true },
+      },
+    },
+    preview: {
+      port: 4173,
+      proxy: {
+        "/api": { target, changeOrigin: true },
+      },
+    },
+  };
+});
+
+################################################################################
+# FRONTEND: frontend/tsconfig.json
+# SAVE AS: frontend/tsconfig.json
+################################################################################
+
+{
+  "compilerOptions": {
+    "target": "ES2022",
+    "useDefineForClassFields": true,
+    "lib": ["ES2022", "DOM", "DOM.Iterable"],
+    "module": "ESNext",
+    "skipLibCheck": true,
+    "moduleResolution": "bundler",
+    "allowImportingTsExtensions": true,
+    "resolveJsonModule": true,
+    "isolatedModules": true,
+    "noEmit": true,
+    "jsx": "react-jsx",
+    "strict": true,
+    "noUnusedLocals": true,
+    "noUnusedParameters": true,
+    "noFallthroughCasesInSwitch": true,
+    "baseUrl": ".",
+    "paths": { "@/*": ["src/*"] }
+  },
+  "include": ["src"]
+}
+
+################################################################################
+# FRONTEND: frontend/tsconfig.node.json
+# SAVE AS: frontend/tsconfig.node.json
+################################################################################
+
+{
+  "compilerOptions": {
+    "composite": true,
+    "skipLibCheck": true,
+    "module": "ESNext",
+    "moduleResolution": "bundler",
+    "strict": true
+  },
+  "include": ["vite.config.ts"]
+}
+
+################################################################################
+# FRONTEND: frontend/src/main.tsx
+# SAVE AS: frontend/src/main.tsx
+################################################################################
+
+import React from "react";
+import ReactDOM from "react-dom/client";
+import App from "./App";
+import "./index.css";
+
+ReactDOM.createRoot(document.getElementById("root")!).render(
+  <React.StrictMode>
+    <App />
+  </React.StrictMode>,
+);
+
+################################################################################
+# FRONTEND: frontend/src/App.tsx
+# SAVE AS: frontend/src/App.tsx
+################################################################################
+
+import { Chat } from "./components/Chat";
+import { ScrapeIngest } from "./components/ScrapeIngest";
+
+export default function App() {
+  return (
+    <main style={{ maxWidth: 980, margin: "0 auto", padding: "2rem 1rem" }}>
+      <header style={{ marginBottom: "1.5rem" }}>
+        <h1 style={{ margin: 0, fontSize: "1.5rem" }}>Agentic RAG Chat</h1>
+        <p style={{ margin: "0.35rem 0 0", color: "#64748b", fontSize: "0.9rem" }}>
+          Playwright tools + RAG context. Production UI talks to <code>/api/v1/chat</code>.
+        </p>
+      </header>
+      <div style={{ display: "grid", gridTemplateColumns: "1fr", gap: "1rem" }}>
+        <Chat />
+        <ScrapeIngest />
+      </div>
+    </main>
+  );
+}
+
+################################################################################
+# FRONTEND: frontend/src/index.css
+# SAVE AS: frontend/src/index.css
+################################################################################
+
+:root {
+  font-family: "Segoe UI", system-ui, sans-serif;
+  line-height: 1.5;
+  color: #0f172a;
+  background: #f8fafc;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  min-height: 100vh;
+}
+
+.messageMarkdown p {
+  margin: 0 0 0.6rem 0;
+}
+
+.messageMarkdown ul,
+.messageMarkdown ol {
+  margin: 0.2rem 0 0.8rem 1.2rem;
+  padding: 0;
+}
+
+.messageMarkdown li {
+  margin: 0.2rem 0;
+}
+
+.messageMarkdown pre {
+  padding: 0.75rem;
+  overflow: auto;
+  border-radius: 10px;
+  background: #0b1020;
+  color: #e5e7eb;
+}
+
+.messageMarkdown code {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New",
+    monospace;
+}
+
+################################################################################
+# FRONTEND: frontend/src/components/Chat.tsx
+# SAVE AS: frontend/src/components/Chat.tsx
+################################################################################
+
+import { useCallback, useState } from "react";
+import ReactMarkdown from "react-markdown";
+import remarkGfm from "remark-gfm";
+import { postChat, type ChatMessage } from "../api/client";
+import { getClientMaxChars, sanitizeClientText } from "../security/client_guardrails";
+
+export function Chat() {
+  const [messages, setMessages] = useState<ChatMessage[]>([]);
+  const [input, setInput] = useState("");
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const MAX_CHARS = getClientMaxChars();
+
+  const send = useCallback(async () => {
+    const text = sanitizeClientText(input);
+    if (!text || loading) return;
+    setError(null);
+    const next: ChatMessage[] = [...messages, { role: "user", content: text }];
+    setMessages(next);
+    setInput("");
+    setLoading(true);
+    try {
+      const reply = await postChat(next);
+      setMessages([...next, { role: "assistant", content: reply }]);
+    } catch (e) {
+      setError(e instanceof Error ? e.message : "Request failed");
+    } finally {
+      setLoading(false);
+    }
+  }, [input, loading, messages]);
+
+  return (
+    <div
+      style={{
+        display: "flex",
+        flexDirection: "column",
+        gap: "0.75rem",
+        border: "1px solid #e2e8f0",
+        borderRadius: 12,
+        padding: "1rem",
+        background: "#fff",
+        minHeight: 420,
+      }}
+    >
+      <div style={{ flex: 1, overflowY: "auto", display: "flex", flexDirection: "column", gap: "0.75rem" }}>
+        {messages.length === 0 && (
+          <p style={{ color: "#94a3b8", margin: 0 }}>Ask a question or request a webpage scrape.</p>
+        )}
+        {messages.map((m, i) => (
+          <div
+            key={i}
+            style={{
+              alignSelf: m.role === "user" ? "flex-end" : "flex-start",
+              maxWidth: "90%",
+              padding: "0.6rem 0.85rem",
+              borderRadius: 10,
+              background: m.role === "user" ? "#0ea5e9" : "#f1f5f9",
+              color: m.role === "user" ? "#fff" : "#0f172a",
+            }}
+          >
+            <strong style={{ fontSize: "0.7rem", opacity: 0.85 }}>{m.role}</strong>
+            <div style={{ marginTop: 6 }}>
+              <div className="messageMarkdown">
+                <ReactMarkdown remarkPlugins={[remarkGfm]}>{m.content}</ReactMarkdown>
+              </div>
+            </div>
+          </div>
+        ))}
+      </div>
+      {error && (
+        <div style={{ color: "#b91c1c", fontSize: "0.875rem" }} role="alert">
+          {error}
+        </div>
+      )}
+      <div style={{ display: "flex", gap: "0.5rem" }}>
+        <textarea
+          value={input}
+          onChange={(e) => setInput(e.target.value)}
+          placeholder="Message…"
+          rows={2}
+          maxLength={MAX_CHARS}
+          style={{
+            flex: 1,
+            resize: "vertical",
+            padding: "0.5rem 0.65rem",
+            borderRadius: 8,
+            border: "1px solid #cbd5e1",
+            fontFamily: "inherit",
+          }}
+          disabled={loading}
+          onKeyDown={(e) => {
+            if (e.key === "Enter" && !e.shiftKey) {
+              e.preventDefault();
+              void send();
+            }
+          }}
+        />
+        <button
+          type="button"
+          onClick={() => void send()}
+          disabled={loading || !sanitizeClientText(input)}
+          style={{
+            alignSelf: "flex-end",
+            padding: "0.5rem 1rem",
+            borderRadius: 8,
+            border: "none",
+            background: "#0f172a",
+            color: "#fff",
+            cursor: loading ? "wait" : "pointer",
+            opacity: loading || !input.trim() ? 0.6 : 1,
+          }}
+        >
+          {loading ? "…" : "Send"}
+        </button>
+      </div>
+    </div>
+  );
+}
+
+################################################################################
+# FRONTEND: frontend/src/components/ScrapeIngest.tsx
+# SAVE AS: frontend/src/components/ScrapeIngest.tsx
+################################################################################
+
+import { useCallback, useState } from "react";
+import { postChat, postScrapeIngest, type ChatMessage, type ScrapeIngestResponse } from "../api/client";
+import { getClientMaxChars, sanitizeClientText } from "../security/client_guardrails";
+
+function formatResponse(r: ScrapeIngestResponse) {
+  return [
+    `URL: ${r.url}`,
+    `Chars scraped: ${r.chars_scraped}`,
+    `Chunks added: ${r.chunks_added}`,
+    "",
+    "Sample:",
+    r.sample,
+  ].join("\n");
+}
+
+export function ScrapeIngest() {
+  const [url, setUrl] = useState("");
+  const [maxChars, setMaxChars] = useState<number>(20000);
+  const [source, setSource] = useState<string>("");
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const [result, setResult] = useState<ScrapeIngestResponse | null>(null);
+  const MAX_CHARS = getClientMaxChars();
+
+  const [askQuestion, setAskQuestion] = useState<string>("");
+  const [askAnswer, setAskAnswer] = useState<string | null>(null);
+  const [askError, setAskError] = useState<string | null>(null);
+
+  const onIngestAndAsk = useCallback(async () => {
+    const trimmed = url.trim();
+    const q = sanitizeClientText(askQuestion);
+    if (!q || loading) return;
+
+    setError(null);
+    setAskError(null);
+    setAskAnswer(null);
+    setResult(null);
+    setLoading(true);
+    try {
+      const resp = await postScrapeIngest({
+        url: trimmed ? trimmed : null,
+        max_chars: maxChars,
+        source: source.trim() ? source.trim() : null,
+      });
+      setResult(resp);
+
+      const prompt = `Using the content you ingested from ${resp.url}, answer the following question:\n${q}`;
+      const messages: ChatMessage[] = [{ role: "user", content: prompt }];
+      const reply = await postChat(messages);
+      setAskAnswer(reply);
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : "Request failed";
+      if (!result) {
+        setError(msg);
+      } else {
+        setAskError(msg);
+      }
+    } finally {
+      setLoading(false);
+    }
+  }, [url, askQuestion, maxChars, source, loading, result]);
+
+  const onSubmit = useCallback(async () => {
+    const trimmed = url.trim();
+    if (loading) return;
+    setError(null);
+    setResult(null);
+    setLoading(true);
+    try {
+      const resp = await postScrapeIngest({
+        url: trimmed ? trimmed : null,
+        max_chars: maxChars,
+        source: source.trim() ? source.trim() : null,
+      });
+      setResult(resp);
+    } catch (e) {
+      setError(e instanceof Error ? e.message : "Request failed");
+    } finally {
+      setLoading(false);
+    }
+  }, [url, maxChars, source, loading]);
+
+  return (
+    <div
+      style={{
+        border: "1px solid #e2e8f0",
+        borderRadius: 12,
+        padding: "1rem",
+        background: "#fff",
+      }}
+    >
+      <h2 style={{ margin: "0 0 0.5rem 0", fontSize: "1.05rem" }}>Scrape &amp; Ingest</h2>
+      <p style={{ margin: "0 0 1rem 0", color: "#64748b", fontSize: "0.9rem" }}>
+        Uses Playwright to scrape the page and stores chunks into Chroma (RAG).
+      </p>
+
+      <div style={{ display: "flex", flexDirection: "column", gap: "0.75rem" }}>
+        <label style={{ display: "flex", flexDirection: "column", gap: 6 }}>
+          <span style={{ fontSize: "0.85rem", color: "#0f172a", opacity: 0.85 }}>URL</span>
+          <input
+            value={url}
+            onChange={(e) => setUrl(e.target.value)}
+            placeholder="https://example.com"
+            style={{
+              padding: "0.55rem 0.65rem",
+              borderRadius: 8,
+              border: "1px solid #cbd5e1",
+              fontFamily: "inherit",
+            }}
+            disabled={loading}
+          />
+        </label>
+
+        <div style={{ display: "flex", gap: "0.75rem", flexWrap: "wrap" }}>
+          <label style={{ display: "flex", flexDirection: "column", gap: 6, minWidth: 180 }}>
+            <span style={{ fontSize: "0.85rem", color: "#0f172a", opacity: 0.85 }}>Max chars</span>
+            <input
+              type="number"
+              value={maxChars}
+              min={1000}
+              max={100000}
+              onChange={(e) => setMaxChars(Number(e.target.value))}
+              style={{
+                padding: "0.55rem 0.65rem",
+                borderRadius: 8,
+                border: "1px solid #cbd5e1",
+                fontFamily: "inherit",
+              }}
+              disabled={loading}
+            />
+          </label>
+
+          <label style={{ display: "flex", flexDirection: "column", gap: 6, flex: 1, minWidth: 220 }}>
+            <span style={{ fontSize: "0.85rem", color: "#0f172a", opacity: 0.85 }}>Source label (optional)</span>
+            <input
+              value={source}
+              onChange={(e) => setSource(e.target.value)}
+              placeholder="e.g. marginai.co.uk"
+              style={{
+                padding: "0.55rem 0.65rem",
+                borderRadius: 8,
+                border: "1px solid #cbd5e1",
+                fontFamily: "inherit",
+              }}
+              disabled={loading}
+            />
+          </label>
+        </div>
+
+        <div style={{ display: "flex", gap: "0.5rem", alignItems: "center" }}>
+          <button
+            type="button"
+            onClick={() => void onSubmit()}
+            disabled={loading}
+            style={{
+              padding: "0.55rem 1rem",
+              borderRadius: 8,
+              border: "none",
+              background: "#0f172a",
+              color: "#fff",
+              cursor: loading ? "wait" : "pointer",
+              opacity: loading ? 0.6 : 1,
+            }}
+          >
+            {loading ? "Working…" : "Scrape &amp; Ingest"}
+          </button>
+
+          <button
+            type="button"
+            onClick={() => void onIngestAndAsk()}
+            disabled={loading || !sanitizeClientText(askQuestion)}
+            style={{
+              padding: "0.55rem 1rem",
+              borderRadius: 8,
+              border: "none",
+              background: "#0f172a",
+              color: "#fff",
+              cursor: loading ? "wait" : "pointer",
+              opacity: loading || !askQuestion.trim() ? 0.6 : 1,
+            }}
+            title="Scrape + ingest, then immediately call /api/v1/chat with your question."
+          >
+            {loading ? "Working…" : "Ingest &amp; Answer"}
+          </button>
+
+          {error && (
+            <div style={{ color: "#b91c1c", fontSize: "0.9rem" }} role="alert">
+              {error}
+            </div>
+          )}
+        </div>
+
+        <label style={{ display: "flex", flexDirection: "column", gap: 6 }}>
+          <span style={{ fontSize: "0.85rem", color: "#0f172a", opacity: 0.85 }}>Question to ask after ingest (Step 9)</span>
+          <input
+            value={askQuestion}
+            onChange={(e) => setAskQuestion(e.target.value)}
+            placeholder="e.g. What does the company do?"
+            maxLength={MAX_CHARS}
+            style={{
+              padding: "0.55rem 0.65rem",
+              borderRadius: 8,
+              border: "1px solid #cbd5e1",
+              fontFamily: "inherit",
+            }}
+            disabled={loading}
+          />
+        </label>
+
+        {result && (
+          <div
+            style={{
+              border: "1px solid #e2e8f0",
+              borderRadius: 10,
+              padding: "0.75rem",
+              background: "#f8fafc",
+            }}
+          >
+            <pre style={{ margin: 0, whiteSpace: "pre-wrap", wordBreak: "break-word", fontFamily: "inherit" }}>
+              {formatResponse(result)}
+            </pre>
+          </div>
+        )}
+
+        {askError && (
+          <div style={{ color: "#b91c1c", fontSize: "0.9rem" }} role="alert">
+            {askError}
+          </div>
+        )}
+
+        {askAnswer && (
+          <div
+            style={{
+              border: "1px solid #e2e8f0",
+              borderRadius: 10,
+              padding: "0.75rem",
+              background: "#f1f5f9",
+            }}
+          >
+            <strong style={{ display: "block", marginBottom: "0.5rem" }}>Assistant (after ingest)</strong>
+            <pre style={{ margin: 0, whiteSpace: "pre-wrap", wordBreak: "break-word", fontFamily: "inherit" }}>
+              {askAnswer}
+            </pre>
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
+################################################################################
+# FRONTEND: frontend/src/api/client.ts
+# SAVE AS: frontend/src/api/client.ts
+################################################################################
+
+const API_BASE = import.meta.env.VITE_API_BASE_URL ?? "";
+
+export type ChatRole = "user" | "assistant" | "system";
+
+export interface ChatMessage {
+  role: ChatRole;
+  content: string;
+}
+
+type ApiErrorShape = {
+  code?: string;
+  message?: string;
+  detail?: unknown;
+};
+
+function getApiErrorMessage(statusText: string, err: ApiErrorShape): string {
+  if (typeof err.message === "string" && err.message.trim()) return err.message;
+  if (typeof err.detail === "string" && err.detail.trim()) return err.detail;
+  if (
+    err.detail &&
+    typeof err.detail === "object" &&
+    "message" in err.detail &&
+    typeof (err.detail as { message?: unknown }).message === "string"
+  ) {
+    return (err.detail as { message: string }).message;
+  }
+  return statusText || "Request failed";
+}
+
+export async function postChat(messages: ChatMessage[]): Promise<string> {
+  const res = await fetch(`${API_BASE}/api/v1/chat`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ messages }),
+  });
+  if (!res.ok) {
+    const err = (await res.json().catch(() => ({}))) as ApiErrorShape;
+    throw new Error(getApiErrorMessage(res.statusText, err));
+  }
+  const data = (await res.json()) as { message: string };
+  return data.message;
+}
+
+export interface ScrapeIngestResponse {
+  url: string;
+  chars_scraped: number;
+  chunks_added: number;
+  sample: string;
+}
+
+export async function postScrapeIngest(params: {
+  url?: string | null;
+  max_chars?: number;
+  source?: string | null;
+}): Promise<ScrapeIngestResponse> {
+  const res = await fetch(`${API_BASE}/api/v1/scrape-ingest`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      url: params.url ?? null,
+      max_chars: params.max_chars ?? 20000,
+      source: params.source ?? null,
+    }),
+  });
+
+  if (!res.ok) {
+    const err = (await res.json().catch(() => ({}))) as ApiErrorShape;
+    throw new Error(getApiErrorMessage(res.statusText, err));
+  }
+
+  return (await res.json()) as ScrapeIngestResponse;
+}
+
+export interface IngestDbResponse {
+  filename: string;
+  pages_extracted: number;
+  chars_extracted: number;
+  chunks_added: number;
+}
+
+export async function postIngestDb(file: File, source?: string | null, maxPages = 0): Promise<IngestDbResponse> {
+  const form = new FormData();
+  form.append("file", file);
+  if (source && source.trim()) form.append("source", source.trim());
+  form.append("max_pages", String(maxPages));
+
+  const res = await fetch(`${API_BASE}/api/v1/ingest-db`, {
+    method: "POST",
+    body: form,
+  });
+
+  if (!res.ok) {
+    const err = (await res.json().catch(() => ({}))) as ApiErrorShape;
+    throw new Error(getApiErrorMessage(res.statusText, err));
+  }
+
+  return (await res.json()) as IngestDbResponse;
+}
+
+################################################################################
+# FRONTEND: frontend/src/security/client_guardrails.ts
+# SAVE AS: frontend/src/security/client_guardrails.ts
+################################################################################
+
+const MAX_CHARS_DEFAULT = 500;
+
+const MAX_CHARS = Number(import.meta.env.VITE_CHAT_INPUT_MAX_CHARS ?? MAX_CHARS_DEFAULT);
+
+export function getClientMaxChars(): number {
+  return Number.isFinite(MAX_CHARS) && MAX_CHARS > 0 ? MAX_CHARS : MAX_CHARS_DEFAULT;
+}
+
+const INJECTION_PATTERNS: RegExp[] = [
+  /ignore\s+(all\s+)?(previous|prior|above|all)\s+instructions/gi,
+  /disregard\s+(all\s+)?(previous|prior|above)/gi,
+  /reveal\s+(your|the)\s+(system\s+)?prompt/gi,
+  /system\s+prompt/gi,
+  /print\s+(your|the)\s+(system\s+)?prompt/gi,
+  /output\s+your\s+system\s+message/gi,
+  /you\s+are\s+now\s+in\s+.*?\s+mode/gi,
+  /\b(?:jailbreak|dane\s+mode)\b/gi,
+  /\[\/?INST\]/gi,
+  /<\|im_start\|>|<\|im_end\|>/gi,
+];
+
+function redactInjectionPhrases(text: string): string {
+  let out = text;
+  for (const re of INJECTION_PATTERNS) {
+    out = out.replace(re, "[REDACTED]");
+  }
+  return out;
+}
+
+export function sanitizeClientText(text: string): string {
+  const maxChars = getClientMaxChars();
+  let t = (text ?? "").replace(/\x00/g, "").trim();
+  if (!t) return "";
+  t = redactInjectionPhrases(t);
+  if (t.length > maxChars) {
+    t = t.slice(0, maxChars);
+  }
+  return t.trim();
+}
+
+################################################################################
+# FRONTEND: frontend/src/vite-env.d.ts
+# SAVE AS: frontend/src/vite-env.d.ts
+################################################################################
+
+/// <reference types="vite/client" />
+
+interface ImportMetaEnv {
+  readonly VITE_API_BASE_URL?: string;
+  readonly VITE_CHAT_INPUT_MAX_CHARS?: string;
+}
+
+interface ImportMeta {
+  readonly env: ImportMetaEnv;
+}
+
+################################################################################
+# ENV: .env.example (project root)
+# SAVE AS: .env (copy and fill in values)
+################################################################################
+
+# Required
+OPENAI_API_KEY=sk-your-key-here
+
+# App
+ENVIRONMENT=development
+DEBUG=false
+LOG_LEVEL=INFO
+
+# CORS
+CORS_ORIGINS=http://localhost:5173,http://127.0.0.1:5173
+
+# API_SERVICE_KEY=
+
+# Rate limit
+RATE_LIMIT_PER_MINUTE=60
+RATE_LIMIT_CHAT_PER_MINUTE=20
+
+# Max request body sizes
+MAX_REQUEST_BYTES_CHAT=8000000
+MAX_REQUEST_BYTES_INGEST=8000000
+MAX_REQUEST_BYTES_SCRAPE_INGEST=5000000
+MAX_REQUEST_BYTES_INGEST_DB=50000000
+
+# Models
+LLM_MODEL=gpt-5.4
+EMBEDDING_MODEL=text-embedding-3-large
+
+# RAG
+RAG_COLLECTION_NAME=rag_docs_gpt54_emb3l
+
+# Playwright
+PLAYWRIGHT_HEADLESS=true
+PLAYWRIGHT_TIMEOUT_MS=30000
+PLAYWRIGHT_ACTION_TIMEOUT_MS=10000
+PLAYWRIGHT_ALLOWED_DOMAINS=
+PLAYWRIGHT_ENFORCE_DOMAIN_ALLOWLIST=false
+PLAYWRIGHT_BLOCK_PRIVATE_IPS=false
+
+# Agent
+RAG_RETRIEVAL_K=4
+AGENT_RECURSION_LIMIT=25
+
+# ORGANIZATION_URL=
+
+# SHOW_OPENAPI=false
+
+# Langfuse (optional)
+# LANGFUSE_PUBLIC_KEY=
+# LANGFUSE_SECRET_KEY=
+# LANGFUSE_HOST=https://cloud.langfuse.com
+
+################################################################################
+# ENV: frontend/.env.example
+# SAVE AS: frontend/.env.local (optional)
+################################################################################
+
+# Leave empty in dev to use Vite proxy (/api -> backend)
+# VITE_API_BASE_URL=http://127.0.0.1:8000
+
+# Optional: proxy target for npm run dev
+# VITE_API_PROXY_TARGET=http://127.0.0.1:8000
+
+================================================================================
+END OF EXPORT - Create directories as needed, then copy each section into its file.
+Run: pip install -r backend/requirements.txt && playwright install
+Run: npm install (in frontend)
+================================================================================

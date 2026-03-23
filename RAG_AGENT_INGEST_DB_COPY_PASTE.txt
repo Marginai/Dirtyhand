@@ -1,0 +1,526 @@
+================================================================================
+COPY-PASTE EXPORT: RAG + AGENT + INGEST_DB (Dirtyhand app)
+================================================================================
+How to use:
+  1. Find a block below between the ######## lines.
+  2. Copy ONLY the code under "BEGIN CODE" through "END CODE" (not the labels).
+  3. Save into the path shown in "SAVE AS:" in your new project.
+
+Dependencies you still need elsewhere (not duplicated here):
+  - app/exceptions.py (ConfigurationError, RAGError, AgentExecutionError, AppError)
+  - app/settings.py (Settings, get_settings)
+  - app/api/deps.py (get_rag, get_app_settings, optional_service_auth)
+  - Wire ingest_db router in FastAPI OR mount route like main.py does for /api/v1/ingest-db
+  - requirements.txt: chromadb, langchain-*, langgraph, playwright, pypdf, fastapi, etc.
+
+================================================================================
+## 1) RAG — Chroma vector store + ingest + retrieval
+================================================================================
+
+################################################################################
+# SAVE AS: backend/app/services/rag_service.py   (or your_package/services/rag_service.py)
+# BEGIN CODE
+################################################################################
+
+"""Persistent Chroma RAG — replaces conversational MemorySaver for document context."""
+
+from __future__ import annotations
+
+import logging
+from typing import TYPE_CHECKING
+
+from langchain_community.vectorstores import Chroma
+from langchain_core.documents import Document
+from langchain_openai import OpenAIEmbeddings
+from langchain_text_splitters import RecursiveCharacterTextSplitter
+
+from app.exceptions import ConfigurationError, RAGError
+from app.settings import Settings, get_settings
+
+if TYPE_CHECKING:
+    pass
+
+logger = logging.getLogger(__name__)
+
+
+class RAGService:
+    def __init__(self, settings: Settings | None = None):
+        self._settings = settings or get_settings()
+        if not self._settings.openai_api_key:
+            raise ConfigurationError("OPENAI_API_KEY is not set in environment")
+        self._embeddings = OpenAIEmbeddings(
+            api_key=self._settings.openai_api_key,
+            model=self._settings.embedding_model,
+        )
+        self._persist = self._settings.chroma_persist_dir
+        self._persist.mkdir(parents=True, exist_ok=True)
+        self._collection = self._settings.rag_collection_name
+        self._vectorstore: Chroma | None = None
+        self._splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=150)
+
+    @property
+    def vectorstore(self) -> Chroma:
+        if self._vectorstore is None:
+            self._vectorstore = Chroma(
+                collection_name=self._collection,
+                embedding_function=self._embeddings,
+                persist_directory=str(self._persist),
+            )
+        return self._vectorstore
+
+    def add_text(self, text: str, metadata: dict | None = None) -> int:
+        """Chunk and ingest plain text."""
+        if not text.strip():
+            raise RAGError("Empty text cannot be ingested")
+        docs = self._splitter.create_documents([text], metadatas=[metadata or {}])
+        return self.add_documents(docs)
+
+    def add_documents(self, documents: list[Document]) -> int:
+        try:
+            self.vectorstore.add_documents(documents)
+            if hasattr(self.vectorstore, "persist"):
+                self.vectorstore.persist()
+        except Exception as e:
+            logger.exception("RAG ingest failed")
+            raise RAGError(str(e)) from e
+        return len(documents)
+
+    def similarity_search(self, query: str, k: int | None = None) -> list[Document]:
+        k = k if k is not None else self._settings.rag_retrieval_k
+        try:
+            return self.vectorstore.similarity_search(query, k=k)
+        except Exception as e:
+            logger.exception("RAG search failed")
+            raise RAGError(str(e)) from e
+
+    def format_context(self, query: str, k: int | None = None) -> str:
+        k = k if k is not None else self._settings.rag_retrieval_k
+        max_docs = min(k, self._settings.rag_max_docs_in_context)
+        min_relevance = self._settings.rag_min_relevance
+
+        docs_with_scores: list[tuple[Document, float]]
+        try:
+            docs_with_scores = self.vectorstore.similarity_search_with_relevance_scores(query, k=k)
+        except Exception:
+            docs = self.similarity_search(query, k=k)
+            docs_with_scores = [(d, 1.0) for d in docs]
+
+        filtered = [(d, s) for (d, s) in docs_with_scores if s >= min_relevance]
+        if not filtered:
+            return ""
+
+        parts: list[str] = []
+        for i, (d, _) in enumerate(filtered[:max_docs], 1):
+            src = d.metadata.get("source", "document")
+            parts.append(f"[{i}] (source: {src})\n{d.page_content}")
+        return "\n\n---\n\n".join(parts)
+
+################################################################################
+# END CODE — rag_service.py
+################################################################################
+
+================================================================================
+## 2) AGENT — LangGraph + tools (uses RAG + Browser below)
+================================================================================
+
+################################################################################
+# SAVE AS: backend/app/services/agent_service.py
+# BEGIN CODE
+################################################################################
+
+"""LangGraph agent with Playwright tools and RAG context (no MemorySaver / checkpointer)."""
+
+from __future__ import annotations
+
+import logging
+from typing import Annotated, Any
+
+from langchain_core.messages import BaseMessage, HumanMessage, SystemMessage
+from langchain_openai import ChatOpenAI
+from langgraph.graph import START, StateGraph
+from langgraph.graph.message import add_messages
+from langgraph.prebuilt import ToolNode, tools_condition
+from typing_extensions import TypedDict
+
+from app.exceptions import AgentExecutionError, ConfigurationError
+from app.services.browser_service import BrowserService
+from app.services.rag_service import RAGService
+from app.settings import Settings, get_settings
+
+logger = logging.getLogger(__name__)
+
+
+class AgentState(TypedDict):
+    messages: Annotated[list[Any], add_messages]
+
+
+def _make_playwright_tools(browser: BrowserService, rag: RAGService, default_url: str) -> list:
+    from langchain_core.tools import tool
+
+    @tool
+    async def scrape_text(
+        url: str | None = None,
+        max_chars: int = 20000,
+    ) -> str:
+        """Scrape a URL with Playwright and return page text (truncated to max_chars).
+
+        This is a single-shot tool (no separate navigate/extract calls), which is safer under concurrency.
+        """
+        target_url = (url or default_url).strip()
+        if not target_url:
+            raise ConfigurationError(
+                "Missing URL for scrape_text: provide `url` or set ORGANIZATION_URL in .env"
+            )
+        if "://" not in target_url:
+            target_url = f"https://{target_url}"
+        text = await browser.navigate_and_extract_text(target_url)
+        truncated = len(text) > max_chars
+        return (
+            f"Scraped {len(text)} chars from {target_url}."
+            + (" TRUNCATED." if truncated else "")
+            + "\n\n"
+            + text[:max_chars]
+        )
+
+    @tool
+    async def scrape_and_ingest(
+        url: str | None = None,
+        max_chars: int = 20000,
+    ) -> str:
+        """Scrape a URL with Playwright and ingest the text into the RAG store.
+
+        Returns truncated scraped text so the LLM can answer in the same request.
+        """
+        target_url = (url or default_url).strip()
+        if not target_url:
+            raise ConfigurationError(
+                "Missing URL for scrape_and_ingest: provide `url` or set ORGANIZATION_URL in .env"
+            )
+        if "://" not in target_url:
+            target_url = f"https://{target_url}"
+        text = await browser.navigate_and_extract_text(target_url)
+        truncated = len(text) > max_chars
+        ingest_text = text[:max_chars]
+        chunks_added = rag.add_text(ingest_text, metadata={"source": target_url})
+        suffix = " (truncated)" if truncated else ""
+        sample = ingest_text[:2000]
+        return (
+            f"Scraped {len(text)} chars from {target_url}{suffix}. "
+            f"Ingested {chunks_added} chunks into RAG. "
+            f"Sample (first {len(sample)} chars):\n{sample}"
+        )
+
+    return [scrape_text, scrape_and_ingest]
+
+
+class AgentService:
+    """Compiles graph once; stateless between HTTP requests (client sends history)."""
+
+    def __init__(
+        self,
+        rag: RAGService,
+        browser: BrowserService,
+        settings: Settings | None = None,
+    ):
+        self._settings = settings or get_settings()
+        self._rag = rag
+        self._browser = browser
+        if not self._settings.openai_api_key:
+            raise ConfigurationError("OPENAI_API_KEY is not set")
+        self._tools = _make_playwright_tools(browser, rag, default_url=self._settings.organization_url)
+        self._llm = ChatOpenAI(
+            model=self._settings.llm_model,
+            api_key=self._settings.openai_api_key,
+            temperature=0.2,
+        )
+        self._llm_with_tools = self._llm.bind_tools(self._tools)
+        self._graph = self._build_graph()
+
+    def _build_graph(self):
+        def chatbot(state: AgentState) -> dict[str, list[BaseMessage]]:
+            messages = list(state["messages"])
+            response = self._llm_with_tools.invoke(messages)
+            return {"messages": [response]}
+
+        graph_builder = StateGraph(AgentState)
+        graph_builder.add_node("chatbot", chatbot)
+        graph_builder.add_node("tools", ToolNode(self._tools))
+        graph_builder.add_conditional_edges("chatbot", tools_condition)
+        graph_builder.add_edge("tools", "chatbot")
+        graph_builder.add_edge(START, "chatbot")
+        return graph_builder.compile()
+
+    def _with_rag_context(self, messages: list[BaseMessage]) -> list[BaseMessage]:
+        """Inject RAG once per request (not on every agent/tool loop)."""
+        last_human = _last_human_text(messages)
+
+        if not last_human:
+            return list(messages)
+
+        ctx = self._rag.format_context(last_human)
+        if not ctx:
+            return list(messages)
+
+        rag_msg = SystemMessage(content=f"Retrieved context:\n\n{ctx}")
+
+        insert_at = 0
+        for i, m in enumerate(messages):
+            if isinstance(m, SystemMessage):
+                insert_at = i + 1
+            else:
+                break
+        return list(messages)[:insert_at] + [rag_msg] + list(messages)[insert_at:]
+
+    async def ainvoke(self, messages: list[BaseMessage]) -> list[BaseMessage]:
+        config = {"recursion_limit": self._settings.agent_recursion_limit}
+        augmented = self._with_rag_context(list(messages))
+        try:
+            result = await self._graph.ainvoke({"messages": augmented}, config=config)
+            return list(result["messages"])
+        except Exception as e:
+            logger.exception("Agent invocation failed")
+            raise AgentExecutionError(str(e), details={"type": type(e).__name__}) from e
+
+
+def _last_human_text(messages: list[BaseMessage]) -> str:
+    for m in reversed(messages):
+        if isinstance(m, HumanMessage):
+            c = m.content
+            return c if isinstance(c, str) else str(c)
+    return ""
+
+################################################################################
+# END CODE — agent_service.py
+################################################################################
+
+NOTE: Agent imports BrowserService. Copy browser_service.py from your Dirtyhand repo
+      (backend/app/services/browser_service.py) into the same services folder, or
+      from DIRTYHAND_FULL_CODE_EXPORT.txt section "browser_service.py".
+
+================================================================================
+## 3) INGEST_DB — PDF upload → chunk → RAG.add_documents
+================================================================================
+
+### 3a) Schema model (add to your schemas file, e.g. app/schemas/chat.py)
+
+################################################################################
+# SAVE AS: merge into app/schemas/chat.py (or a dedicated schemas/ingest.py)
+# BEGIN CODE — IngestDbResponse only
+################################################################################
+
+from pydantic import BaseModel  # if not already imported
+
+
+class IngestDbResponse(BaseModel):
+    filename: str
+    pages_extracted: int
+    chars_extracted: int
+    chunks_added: int
+
+################################################################################
+# END CODE — IngestDbResponse
+################################################################################
+
+### 3b) PDF extraction + chunking
+
+################################################################################
+# SAVE AS: backend/app/services/pdf_service.py
+# BEGIN CODE
+################################################################################
+
+from __future__ import annotations
+
+import io
+import logging
+from typing import Optional
+
+from langchain_core.documents import Document
+from langchain_text_splitters import RecursiveCharacterTextSplitter
+from pypdf import PdfReader
+
+logger = logging.getLogger(__name__)
+
+
+class PDFService:
+    """Extract text from PDFs and convert it into chunked LangChain Documents."""
+
+    def __init__(self, chunk_size: int = 1000, chunk_overlap: int = 150):
+        self._splitter = RecursiveCharacterTextSplitter(chunk_size=chunk_size, chunk_overlap=chunk_overlap)
+
+    def extract_text_pages(
+        self,
+        pdf_bytes: bytes,
+        *,
+        max_pages: int = 0,
+    ) -> list[str]:
+        reader = PdfReader(io.BytesIO(pdf_bytes))
+        total_pages = len(reader.pages)
+        use_pages = total_pages if max_pages <= 0 else min(total_pages, max_pages)
+
+        pages: list[str] = []
+        for i in range(use_pages):
+            page = reader.pages[i]
+            text = page.extract_text() or ""
+            pages.append(text)
+        return pages
+
+    def chunk_pages(
+        self,
+        pages_text: list[str],
+        *,
+        source: str,
+    ) -> list[Document]:
+        documents: list[Document] = []
+        for idx, text in enumerate(pages_text, start=1):
+            t = (text or "").strip()
+            if not t:
+                continue
+            docs = self._splitter.create_documents(
+                [t],
+                metadatas=[{"source": source, "page": idx}],
+            )
+            documents.extend(docs)
+        return documents
+
+################################################################################
+# END CODE — pdf_service.py
+################################################################################
+
+### 3c) FastAPI route (this app registers it at POST /api/v1/ingest-db without router prefix in main)
+
+################################################################################
+# SAVE AS: backend/app/api/v1/ingest_db.py
+# NOTE: In Dirtyhand, main.py imports ingest_db handler directly, not the router.
+#       If you use the router below, include it with prefix or mount accordingly.
+# BEGIN CODE
+################################################################################
+
+import asyncio
+import logging
+
+from fastapi import APIRouter, Depends, File, Form, Request, UploadFile
+from pydantic import Field
+
+from app.api.deps import get_app_settings, get_rag, optional_service_auth
+from app.exceptions import RAGError
+from app.schemas.chat import IngestDbResponse
+from app.services.pdf_service import PDFService
+from app.settings import Settings
+
+logger = logging.getLogger(__name__)
+
+router = APIRouter(prefix="/ingest-db", tags=["ingest"])
+
+
+@router.post("", dependencies=[Depends(optional_service_auth)], response_model=IngestDbResponse)
+async def ingest_db(
+    request: Request,
+    file: UploadFile = File(...),
+    source: str | None = Form(default=None, max_length=512),
+    max_pages: int = Form(default=0, ge=0, le=2000),
+    settings: Settings = Depends(get_app_settings),
+    rag=Depends(get_rag),
+):
+    _ = request
+    _ = settings
+
+    filename = file.filename or "uploaded.pdf"
+    src_label = source or filename
+
+    if not (filename.lower().endswith(".pdf")):
+        from fastapi import HTTPException, status
+
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Only .pdf files are supported")
+
+    data = await file.read()
+    if not data:
+        from fastapi import HTTPException, status
+
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Empty PDF upload")
+
+    pdf_service = PDFService()
+
+    try:
+        try:
+            pages_text = await asyncio.to_thread(
+                pdf_service.extract_text_pages, data, max_pages=max_pages
+            )
+        except Exception as e:
+            logger.exception("PDF extraction failed")
+            from fastapi import HTTPException, status
+
+            client_message = (
+                "Invalid or unreadable PDF."
+                if settings.is_production and not settings.debug
+                else str(e)[:300]
+            )
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail={"code": "pdf_extract_error", "message": client_message},
+            ) from e
+
+        chars_extracted = sum(len(t or "") for t in pages_text)
+
+        try:
+            docs = pdf_service.chunk_pages(pages_text, source=src_label)
+        except Exception as e:
+            logger.exception("PDF chunking failed")
+            from fastapi import HTTPException, status
+
+            client_message = (
+                "Failed to process PDF content."
+                if settings.is_production and not settings.debug
+                else str(e)[:300]
+            )
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail={"code": "pdf_chunk_error", "message": client_message},
+            ) from e
+    except Exception:
+        raise
+
+    try:
+        chunks_added = rag.add_documents(docs)
+    except RAGError as e:
+        logger.exception("PDF ingest failed")
+        client_message = (
+            "PDF ingest failed."
+            if settings.is_production and not settings.debug
+            else str(e)
+        )
+        from fastapi import HTTPException, status
+
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail={"code": "rag_error", "message": client_message},
+        ) from e
+
+    return IngestDbResponse(
+        filename=filename,
+        pages_extracted=len(pages_text),
+        chars_extracted=chars_extracted,
+        chunks_added=chunks_added,
+    )
+
+################################################################################
+# END CODE — ingest_db.py
+################################################################################
+
+================================================================================
+## PIP (minimal) for these three areas
+================================================================================
+chromadb>=0.5.0
+langchain>=0.3.0
+langchain-core>=0.3.0
+langchain-openai>=0.2.0
+langchain-community>=0.3.0
+langchain-text-splitters>=0.3.0
+langgraph>=0.2.0
+playwright>=1.49.0
+pypdf>=5.0.0
+fastapi>=0.115.0
+pydantic>=2.9.0
+
+================================================================================
+END OF RAG + AGENT + INGEST_DB EXPORT
+================================================================================
